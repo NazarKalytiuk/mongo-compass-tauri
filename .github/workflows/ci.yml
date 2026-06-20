@@ -78,10 +78,6 @@ jobs:
   e2e:
     name: E2E (Playwright · Chromium)
     runs-on: ubuntu-latest
-    # Non-blocking for now: the query-bar is mid-migration to a CodeMirror editor,
-    # so the existing spec's plain-<input> selectors need updating. Remove this
-    # once tests/e2e/connection.spec.ts is updated for the new editor.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 

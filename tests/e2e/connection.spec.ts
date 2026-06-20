@@ -247,7 +247,7 @@ test.describe("Connection Workflow (E2E)", () => {
     await expect(page.locator("text=Wireless Mouse")).toBeVisible();
 
     // 4. Fill in search filter input
-    const filterInput = page.getByPlaceholder("e.g. { \"status\": \"active\" }");
+    const filterInput = page.getByRole("textbox", { name: "Filter" });
     await filterInput.fill('{"name": "Laptop"}');
 
     // 5. Run the query
@@ -419,7 +419,7 @@ test.describe("Connection Workflow (E2E)", () => {
     const collectionBtn = page.locator("div.w-80").getByRole("button", { name: "users", exact: true });
     await collectionBtn.click();
     
-    const filterInput = page.getByPlaceholder("e.g. { \"status\": \"active\" }");
+    const filterInput = page.getByRole("textbox", { name: "Filter" });
     await expect(filterInput).not.toBeFocused();
     
     await page.keyboard.press("Control+k");
@@ -434,7 +434,7 @@ test.describe("Connection Workflow (E2E)", () => {
     await collectionBtn.click();
     
     // Run search query
-    const filterInput = page.getByPlaceholder("e.g. { \"status\": \"active\" }");
+    const filterInput = page.getByRole("textbox", { name: "Filter" });
     await filterInput.fill('{"name": "Laptop"}');
     await page.click("button:has-text('Find')");
     
@@ -452,7 +452,7 @@ test.describe("Connection Workflow (E2E)", () => {
     
     // Check it switches back to explorer and filter is populated
     await expect(page.locator("text=users_db.users")).toBeVisible();
-    await expect(filterInput).toHaveValue('{"name": "Laptop"}');
+    await expect(filterInput).toContainText('{"name": "Laptop"}');
   });
 
   test("should list active operations and support killing them", async ({ page }) => {
