@@ -4,8 +4,16 @@ test.describe("Connection Workflow (E2E)", () => {
   test.beforeEach(async ({ page }) => {
     // Inject mock Tauri invoke internals before the application runs
     await page.addInitScript(() => {
+      let nextCallbackId = 1;
       window.__TAURI_INTERNALS__ = {
+        transformCallback: () => nextCallbackId++,
         invoke: async (cmd: string, args: any) => {
+          if (cmd === "plugin:event|listen") {
+            return args.handler;
+          }
+          if (cmd === "plugin:event|unlisten") {
+            return null;
+          }
           if (cmd === "connect_db") {
             if (args.uri.includes("invalid")) {
               throw new Error("DNS resolution failed for hostname");
@@ -29,6 +37,18 @@ test.describe("Connection Workflow (E2E)", () => {
           }
           if (cmd === "get_collection_size") {
             return 45200;
+          }
+          if (cmd === "ensure_database_tools") {
+            return {
+              version: "100.17.0",
+              platform: "macos",
+              arch: "arm64",
+              binDir: "/mock/app-data/mongodb-database-tools/100.17.0/bin",
+              downloaded: false,
+            };
+          }
+          if (cmd === "run_mongodump" || cmd === "run_mongorestore") {
+            return null;
           }
           if (cmd === "start_shell") {
             return null;
@@ -97,6 +117,9 @@ test.describe("Connection Workflow (E2E)", () => {
           }
           throw new Error(`Unhandled Tauri E2E command: ${cmd}`);
         },
+      };
+      window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+        unregisterListener: () => {},
       };
     });
 
@@ -490,5 +513,22 @@ test.describe("Connection Workflow (E2E)", () => {
     });
 
     await page.click("button:has-text('Kill Op')");
+  });
+
+  test("should prepare managed tools and run dump and restore", async ({ page }) => {
+    await page.click("button:has-text('Connect')");
+    await expect(page.locator("text=Welcome to Compass+")).toBeVisible();
+
+    await page.getByRole("button", { name: "Dump / Restore" }).click();
+    await expect(page.getByText("MongoDB Database Tools 100.17.0 are ready.")).toBeVisible();
+    await expect(page.getByText("App-managed installation · macos/arm64")).toBeVisible();
+
+    await page.getByRole("button", { name: "Run mongodump" }).click();
+    await expect(page.getByText("Database dump finished!")).toBeVisible();
+
+    await page.getByRole("button", { name: /mongorestore \(Import Archive\)/ }).click();
+    await page.getByLabel("Source BSON / GZ Archive Path").fill("/tmp/users-db-dump");
+    await page.getByRole("button", { name: "Run mongorestore" }).click();
+    await expect(page.getByText("Database restore finished!")).toBeVisible();
   });
 });

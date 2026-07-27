@@ -1,3 +1,4 @@
+mod database_tools;
 mod mongo;
 
 use mongo::{AppState, ConnectionInfo, DocumentListResult};
@@ -177,6 +178,19 @@ async fn server_status(state: State<'_, AppState>) -> Result<mongo::ServerStatus
 #[tauri::command]
 async fn repl_set_status(state: State<'_, AppState>) -> Result<mongo::ReplSetStatusResult, String> {
     mongo::repl_set_status(&state).await
+}
+
+#[tauri::command]
+async fn ensure_database_tools(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<database_tools::DatabaseToolsInfo, String> {
+    database_tools::ensure_database_tools(
+        &app_handle,
+        &state.database_tools_install,
+        &state.database_tools_last_checked,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -408,6 +422,7 @@ pub fn run() {
             kill_op,
             server_status,
             repl_set_status,
+            ensure_database_tools,
             run_mongodump,
             run_mongorestore,
             get_collection_validator,

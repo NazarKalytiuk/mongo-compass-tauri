@@ -1,6 +1,6 @@
 [package]
 name = "mongo-compass-tauri"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -25,4 +25,9 @@ serde_json = "1"
 mongodb = "3.1.0"
 bson = { version = "2.13.0", features = ["uuid-0_8", "chrono-0_4", "serde_with"] }
 tokio = { version = "1", features = ["full"] }
-
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+sha2 = "0.10"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"

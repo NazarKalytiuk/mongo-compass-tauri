@@ -28,6 +28,27 @@ interface DumpRestorePreset {
   stopOnError?: boolean;
 }
 
+interface DatabaseToolsInfo {
+  version: string;
+  platform: string;
+  arch: string;
+  binDir: string;
+  downloaded: boolean;
+}
+
+interface DatabaseToolsProgress {
+  phase: "checking" | "downloading" | "verifying" | "extracting" | "ready" | "error";
+  message: string;
+  downloadedBytes?: number;
+  totalBytes?: number;
+}
+
+interface DatabaseToolsState extends DatabaseToolsProgress {
+  version?: string;
+  platform?: string;
+  arch?: string;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 Bytes";
   const k = 1024;
@@ -72,7 +93,34 @@ export function DumpRestoreView({
 
   const [logs, setLogs] = useState<string[]>([]);
   const [errorText, setErrorText] = useState<string | null>(null);
+  const [databaseTools, setDatabaseTools] = useState<DatabaseToolsState>({
+    phase: "checking",
+    message: "Preparing MongoDB Database Tools…",
+  });
   const logsEndRef = useRef<HTMLDivElement>(null);
+
+  const prepareDatabaseTools = async () => {
+    setDatabaseTools({
+      phase: "checking",
+      message: "Checking the latest MongoDB Database Tools release…",
+    });
+    try {
+      const info = await invoke<DatabaseToolsInfo>("ensure_database_tools");
+      const version = info?.version || "installed";
+      setDatabaseTools({
+        phase: "ready",
+        message: `MongoDB Database Tools ${version} are ready.`,
+        version,
+        platform: info?.platform,
+        arch: info?.arch,
+      });
+    } catch (err) {
+      setDatabaseTools({
+        phase: "error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
 
   // Load presets from localStorage
   useEffect(() => {
@@ -123,20 +171,42 @@ export function DumpRestoreView({
   useEffect(() => {
     let unlistenDump: (() => void) | null = null;
     let unlistenRestore: (() => void) | null = null;
+    let unlistenTools: (() => void) | null = null;
+    let cancelled = false;
 
     const setup = async () => {
-      unlistenDump = await listen<{ text: string }>("dump-log", (e) =>
-        setLogs((prev) => [...prev, e.payload.text])
-      );
-      unlistenRestore = await listen<{ text: string }>("restore-log", (e) =>
-        setLogs((prev) => [...prev, e.payload.text])
-      );
+      [unlistenDump, unlistenRestore, unlistenTools] = await Promise.all([
+        listen<{ text: string }>("dump-log", (e) =>
+          setLogs((prev) => [...prev, e.payload.text])
+        ),
+        listen<{ text: string }>("restore-log", (e) =>
+          setLogs((prev) => [...prev, e.payload.text])
+        ),
+        listen<DatabaseToolsProgress>("database-tools-progress", (e) => {
+          if (!cancelled) {
+            setDatabaseTools((previous) => ({
+              ...previous,
+              ...e.payload,
+            }));
+          }
+        }),
+      ]);
+
+      if (cancelled) {
+        unlistenDump();
+        unlistenRestore();
+        unlistenTools();
+        return;
+      }
+      await prepareDatabaseTools();
     };
-    setup();
+    void setup();
 
     return () => {
+      cancelled = true;
       unlistenDump?.();
       unlistenRestore?.();
+      unlistenTools?.();
     };
   }, []);
 
@@ -285,6 +355,63 @@ export function DumpRestoreView({
       </div>
 
       <div className="flex-1 p-6 overflow-y-auto max-w-2xl w-full mx-auto">
+        <div
+          aria-live="polite"
+          className={`mb-4 border p-3.5 rounded-xl flex items-start gap-3 text-xs shadow-2xs ${
+            databaseTools.phase === "ready"
+              ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+              : databaseTools.phase === "error"
+                ? "bg-red-50 border-red-200 text-red-700"
+                : "bg-amber-50 border-amber-200 text-amber-800"
+          }`}
+        >
+          {databaseTools.phase === "ready" ? (
+            <Check className="w-4 h-4 shrink-0 mt-0.5" />
+          ) : databaseTools.phase === "error" ? (
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          ) : (
+            <Loader2 className="w-4 h-4 shrink-0 mt-0.5 animate-spin" />
+          )}
+          <div className="flex-1 min-w-0">
+            <p className="font-bold leading-relaxed">{databaseTools.message}</p>
+            {databaseTools.phase === "ready" && databaseTools.platform && databaseTools.arch && (
+              <p className="text-[10px] opacity-75 mt-0.5 font-mono">
+                App-managed installation · {databaseTools.platform}/{databaseTools.arch}
+              </p>
+            )}
+            {databaseTools.phase === "downloading"
+              && databaseTools.downloadedBytes !== undefined
+              && databaseTools.totalBytes !== undefined
+              && databaseTools.totalBytes > 0 && (
+                <div className="mt-2">
+                  <div className="h-1.5 bg-amber-200 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-[#F2673C] transition-[width]"
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          (databaseTools.downloadedBytes / databaseTools.totalBytes) * 100
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                  <p className="text-[10px] mt-1 font-mono opacity-75">
+                    {formatBytes(databaseTools.downloadedBytes)} / {formatBytes(databaseTools.totalBytes)}
+                  </p>
+                </div>
+              )}
+          </div>
+          {databaseTools.phase === "error" && (
+            <button
+              type="button"
+              onClick={() => void prepareDatabaseTools()}
+              className="px-3 py-1.5 rounded-lg border border-red-300 bg-white hover:bg-red-100 font-bold cursor-pointer"
+            >
+              Retry
+            </button>
+          )}
+        </div>
+
         <form
           onSubmit={triggerProcess}
           className="bg-white p-6 rounded-xl border border-[#111827]/10 shadow-xs space-y-5"

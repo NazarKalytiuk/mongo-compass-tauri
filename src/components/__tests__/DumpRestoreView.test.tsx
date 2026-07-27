@@ -11,14 +11,26 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 // Capture event listeners so tests can fire them manually
 type LogHandler = (e: { payload: { text: string } }) => void;
+type ToolsProgressHandler = (e: {
+  payload: {
+    phase: "checking" | "downloading" | "verifying" | "extracting" | "ready" | "error";
+    message: string;
+    downloadedBytes?: number;
+    totalBytes?: number;
+  };
+}) => void;
 let capturedDumpLogHandler: LogHandler | null = null;
 let capturedRestoreLogHandler: LogHandler | null = null;
+let capturedToolsProgressHandler: ToolsProgressHandler | null = null;
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockImplementation(
     (event: string, handler: LogHandler) => {
       if (event === "dump-log") capturedDumpLogHandler = handler;
       if (event === "restore-log") capturedRestoreLogHandler = handler;
+      if (event === "database-tools-progress") {
+        capturedToolsProgressHandler = handler as unknown as ToolsProgressHandler;
+      }
       return Promise.resolve(() => {});
     }
   ),
@@ -44,10 +56,14 @@ describe("DumpRestoreView", () => {
     localStorage.clear();
     capturedDumpLogHandler = null;
     capturedRestoreLogHandler = null;
+    capturedToolsProgressHandler = null;
 
     vi.mocked(listen).mockImplementation((event, handler) => {
       if (event === "dump-log") capturedDumpLogHandler = handler as LogHandler;
       if (event === "restore-log") capturedRestoreLogHandler = handler as LogHandler;
+      if (event === "database-tools-progress") {
+        capturedToolsProgressHandler = handler as unknown as ToolsProgressHandler;
+      }
       return Promise.resolve(() => {});
     });
 
@@ -55,7 +71,70 @@ describe("DumpRestoreView", () => {
     vi.mocked(invoke).mockImplementation(async (cmd) => {
       if (cmd === "list_collections") return [];
       if (cmd === "get_collection_size") return 0;
+      if (cmd === "ensure_database_tools") {
+        return {
+          version: "100.17.0",
+          platform: "macos",
+          arch: "arm64",
+          binDir: "/app-data/mongodb-database-tools/100.17.0/bin",
+          downloaded: false,
+        };
+      }
       return null;
+    });
+  });
+
+  it("prepares app-managed MongoDB Database Tools when opened", async () => {
+    await act(async () => {
+      render(<DumpRestoreView {...defaultProps} />);
+    });
+    await flush();
+
+    expect(invoke).toHaveBeenCalledWith("ensure_database_tools");
+    expect(screen.getByText("MongoDB Database Tools 100.17.0 are ready.")).toBeInTheDocument();
+    expect(screen.getByText("App-managed installation · macos/arm64")).toBeInTheDocument();
+  });
+
+  it("shows MongoDB Database Tools download progress", async () => {
+    let resolveTools: ((value: unknown) => void) | null = null;
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "list_collections") return [];
+      if (cmd === "get_collection_size") return 0;
+      if (cmd === "ensure_database_tools") {
+        return new Promise((resolve) => {
+          resolveTools = resolve;
+        });
+      }
+      return null;
+    });
+
+    await act(async () => {
+      render(<DumpRestoreView {...defaultProps} />);
+    });
+    await flush();
+
+    await act(async () => {
+      capturedToolsProgressHandler?.({
+        payload: {
+          phase: "downloading",
+          message: "Downloading MongoDB Database Tools…",
+          downloadedBytes: 1024,
+          totalBytes: 4096,
+        },
+      });
+    });
+
+    expect(screen.getByText("Downloading MongoDB Database Tools…")).toBeInTheDocument();
+    expect(screen.getByText("1 KB / 4 KB")).toBeInTheDocument();
+
+    await act(async () => {
+      resolveTools?.({
+        version: "100.17.0",
+        platform: "macos",
+        arch: "arm64",
+        binDir: "/app-data/tools/bin",
+        downloaded: true,
+      });
     });
   });
 

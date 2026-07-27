@@ -5,6 +5,7 @@ use mongodb::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tauri::Emitter;
 use std::path::PathBuf;
@@ -17,6 +18,8 @@ pub struct AppState {
     pub client: Arc<Mutex<Option<Client>>>,
     pub uri: Arc<Mutex<Option<String>>>,
     pub shell_stdin: Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>,
+    pub database_tools_install: Arc<Mutex<()>>,
+    pub database_tools_last_checked: Arc<Mutex<Option<Instant>>>,
 }
 
 impl AppState {
@@ -25,6 +28,8 @@ impl AppState {
             client: Arc::new(Mutex::new(None)),
             uri: Arc::new(Mutex::new(None)),
             shell_stdin: Arc::new(tokio::sync::Mutex::new(None)),
+            database_tools_install: Arc::new(Mutex::new(())),
+            database_tools_last_checked: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -964,35 +969,33 @@ pub struct LogPayload {
     pub text: String,
 }
 
-// Find path to executable (mongodump/mongorestore)
+// mongodump and mongorestore are app-managed; mongosh remains an optional
+// system dependency for the separate shell feature.
 fn find_executable(name: &str) -> Result<PathBuf, String> {
-    // 1. Check common absolute paths on macOS / Unix first
     let common_paths = [
-        format!("/opt/homebrew/bin/{}", name),
-        format!("/usr/local/bin/{}", name),
-        format!("/usr/bin/{}", name),
-        format!("/bin/{}", name),
+        format!("/opt/homebrew/bin/{name}"),
+        format!("/usr/local/bin/{name}"),
+        format!("/usr/bin/{name}"),
+        format!("/bin/{name}"),
     ];
     for path_str in &common_paths {
         let path = PathBuf::from(path_str);
-        if path.exists() && path.is_file() {
+        if path.is_file() {
             return Ok(path);
         }
     }
 
-    // 2. Check PATH environment variable
     if let Some(path_env) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_env) {
-            let path = dir.join(name);
-            if path.exists() && path.is_file() {
+        for directory in std::env::split_paths(&path_env) {
+            let path = directory.join(name);
+            if path.is_file() {
                 return Ok(path);
             }
         }
     }
 
     Err(format!(
-        "Could not find '{}' executable. Please make sure MongoDB Database Tools are installed (e.g., 'brew install mongodb-database-tools') and available in your PATH.",
-        name
+        "Could not find '{name}' executable. Install it and make it available in PATH."
     ))
 }
 
@@ -1009,11 +1012,16 @@ pub async fn run_mongodump(
 ) -> Result<(), String> {
     let uri = get_uri(&state).await?;
 
-    // Find mongodump path (skipped for dry run since we don't need to execute)
     let exec_path = if dry_run.unwrap_or(false) {
         PathBuf::from("mongodump")
     } else {
-        find_executable("mongodump")?
+        let tools = crate::database_tools::ensure_database_tools(
+            app_handle,
+            &state.database_tools_install,
+            &state.database_tools_last_checked,
+        )
+        .await?;
+        crate::database_tools::executable_path(&tools, "mongodump")?
     };
 
     // Build arguments
@@ -1066,11 +1074,16 @@ pub async fn run_mongorestore(
 ) -> Result<(), String> {
     let uri = get_uri(&state).await?;
 
-    // Find mongorestore path (skipped for dry run since we don't need to execute)
     let exec_path = if dry_run.unwrap_or(false) {
         PathBuf::from("mongorestore")
     } else {
-        find_executable("mongorestore")?
+        let tools = crate::database_tools::ensure_database_tools(
+            app_handle,
+            &state.database_tools_install,
+            &state.database_tools_last_checked,
+        )
+        .await?;
+        crate::database_tools::executable_path(&tools, "mongorestore")?
     };
 
     // Build arguments
@@ -1897,18 +1910,4 @@ mod tests {
         assert_eq!(find_cmd.get_i64("limit").unwrap(), 20);
     }
 
-    #[test]
-    fn test_find_executable() {
-        let res = find_executable("non_existent_executable_12345");
-        assert!(res.is_err());
-        assert!(res.unwrap_err().contains("Could not find"));
-
-        // Since the machine running tests has mongodump, find_executable should find it
-        let res_dump = find_executable("mongodump");
-        if res_dump.is_ok() {
-            let path = res_dump.unwrap();
-            assert!(path.exists());
-            assert!(path.is_file());
-        }
-    }
 }
