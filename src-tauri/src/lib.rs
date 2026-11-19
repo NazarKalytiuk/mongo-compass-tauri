@@ -2,13 +2,56 @@ mod database_tools;
 // Public so the integration tests in tests/ can drive them against a real server.
 pub mod ejson;
 pub mod mongo;
+pub mod secrets;
 
 use mongo::{AppState, ConnectionInfo, DocumentListResult};
 use tauri::State;
 
 #[tauri::command]
-async fn connect_db(state: State<'_, AppState>, uri: String) -> Result<ConnectionInfo, String> {
+async fn connect_db(
+    state: State<'_, AppState>,
+    uri: String,
+    connection_id: Option<String>,
+) -> Result<ConnectionInfo, String> {
+    let uri = resolve_uri(uri, connection_id).await?;
     mongo::connect(&state, uri).await
+}
+
+/// Fills in the stored password of a saved connection (see `secrets`).
+/// Credential-store calls can block (macOS may ask for Keychain access).
+async fn resolve_uri(uri: String, connection_id: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || secrets::resolve(&uri, connection_id.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Moves the password of `uri` into the credential store under `connection_id` and
+/// returns the URI without it, which is what the webview keeps. A URI without a
+/// password leaves any stored password untouched.
+#[tauri::command]
+async fn save_connection_password(connection_id: String, uri: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (stripped, password) = secrets::split_password(&uri);
+        if let Some(password) = password {
+            secrets::store(&connection_id, &password)?;
+        }
+        Ok(stripped)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn delete_connection_password(connection_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || secrets::delete(&connection_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The URI without its password (pure; touches no storage).
+#[tauri::command]
+fn strip_password(uri: String) -> String {
+    secrets::split_password(&uri).0
 }
 
 #[tauri::command]
@@ -269,7 +312,8 @@ async fn insert_many(
 }
 
 #[tauri::command]
-async fn diagnose_uri(uri: String) -> Result<mongo::ConnectionDiagnostics, String> {
+async fn diagnose_uri(uri: String, connection_id: Option<String>) -> Result<mongo::ConnectionDiagnostics, String> {
+    let uri = resolve_uri(uri, connection_id).await?;
     mongo::diagnose_uri(uri).await
 }
 
@@ -405,6 +449,9 @@ pub fn run() {
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             connect_db,
+            save_connection_password,
+            delete_connection_password,
+            strip_password,
             disconnect_db,
             list_databases,
             list_collections,

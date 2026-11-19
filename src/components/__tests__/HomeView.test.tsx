@@ -102,6 +102,7 @@ vi.mock("../../queryLogger", () => ({
 const defaultConnectionInfo: ConnectionInfo = {
   version: "8.0.0",
   databases: ["admin", "local", "store_db"],
+  display_uri: "mongodb://localhost:27017",
 };
 
 const defaultUri = "mongodb://localhost:27017";

@@ -18,7 +18,14 @@ React (src/)  ──invoke()──▶  Tauri IPC  ──▶  Rust command (src-t
 ```
 
 - **Frontend → backend**: only via `invoke<T>("command_name", args)`. No event bus, no websockets, no custom IPC. All commands are async on the Rust side.
-- **Backend state**: one `mongodb::Client` held in `Arc<tokio::sync::Mutex<Option<Client>>>` inside `AppState` (`src-tauri/src/mongo.rs`). Disconnect resets the `Option` to `None`.
+- **Backend state**: the active connection is one `Session { client, uri }` behind `Arc<tokio::sync::Mutex<Option<Session>>>` in `AppState` (`src-tauri/src/mongo.rs`). Read it through `get_client` / `get_uri`, which only clone under the lock. Never hold the lock across a network call. `connect` replaces the session only after the server answered, and disconnect resets it to `None`.
+- **Connection passwords** (`src-tauri/src/secrets.rs`) must never reach the webview's storage or a process command line:
+  - Saved connections keep their URI *without* the password in localStorage (`ConnectionPreset.hasPassword` marks one).
+  - The password is in the OS credential store via `keyring`, keyed by the preset id. Commands: `save_connection_password`, `delete_connection_password`, `strip_password`.
+  - `connect_db` / `diagnose_uri` take an optional `connectionId` and fill the password in on the backend.
+  - The UI shows only `ConnectionInfo.display_uri` (password masked).
+  - mongodump/mongorestore get the URI from a private `--config` YAML file (`ToolConfig`, mode 0600, deleted afterwards).
+  - mongosh starts with `--nodb` and connects from stdin.
 - **BSON bridge** (`src-tauri/src/ejson.rs`): documents travel as MongoDB Extended JSON v2, shaped to survive `JSON.parse`/`JSON.stringify` in the webview.
   - Int32 and fractional doubles are plain numbers.
   - Int64 is `{"$numberLong"}` and integral or non-finite doubles are `{"$numberDouble"}`. As plain numbers they would lose precision or change type.
@@ -53,7 +60,7 @@ React (src/)  ──invoke()──▶  Tauri IPC  ──▶  Rust command (src-t
 - `src/components/AggregationBuilder.tsx` — Pipeline stages with autocomplete + live preview.
 - `src-tauri/src/lib.rs` — 12 `#[tauri::command]` handlers; the `run()` builder.
 - `src-tauri/src/mongo.rs` — `AppState`, `connect`/`disconnect`, CRUD, aggregation, `json_to_document` helper, inline `#[cfg(test)]` unit tests.
-- `src-tauri/tauri.conf.json` — App id `com.nazarkalituk.mongo-compass-tauri`, window 1200×800 `"Compass+"`, CSP `null`, bundle `"all"`.
+- `src-tauri/tauri.conf.json` — App id `com.nazarkalituk.mongo-compass-tauri`, window 1200×800 `"Compass+"`, strict CSP (self only, IPC), bundle `"all"`.
 - `src-tauri/capabilities/default.json` — `core:default` + `opener:default` only.
 
 ## Tauri Commands (the public IPC surface)
@@ -168,7 +175,7 @@ No coverage threshold is configured. Aim for behavioral coverage: error paths, e
 ## Things to watch for
 
 - **Port 1420 is sacred** — Tauri expects it, Playwright expects it, Vite's `strictPort` will fail otherwise.
-- **CSP is `null`** — do not add inline scripts or remote origins without an explicit security review.
+- **CSP is strict** (`default-src 'self'`, no inline scripts, `connect-src` IPC only). Remote origins or inline scripts need an explicit security review.
 - **No `data-testid`** — the existing E2E spec relies on semantic selectors; adding `data-testid` is fine if you need it, but update the spec to match.
 - **Capabilities file is minimal** — `core:default + opener:default`. Adding a new Tauri plugin requires both adding the plugin in `lib.rs` and extending `src-tauri/capabilities/default.json`.
 - **README is a template stub** — do not assume it documents the project. Update it when you add user-visible features.

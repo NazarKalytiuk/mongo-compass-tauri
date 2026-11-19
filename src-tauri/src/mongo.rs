@@ -14,10 +14,18 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-// Global application state to store the active MongoDB Client and connection URI
+/// The active connection. Client and URI are replaced together, so they always
+/// describe the same server.
+#[derive(Clone)]
+struct Session {
+    client: Client,
+    /// Full connection string, including the password; never sent to the webview.
+    uri: String,
+}
+
+// Global application state
 pub struct AppState {
-    pub client: Arc<Mutex<Option<Client>>>,
-    pub uri: Arc<Mutex<Option<String>>>,
+    session: Arc<Mutex<Option<Session>>>,
     pub shell_stdin: Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>,
     pub database_tools_install: Arc<Mutex<()>>,
     pub database_tools_last_checked: Arc<Mutex<Option<Instant>>>,
@@ -26,8 +34,7 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         Self {
-            client: Arc::new(Mutex::new(None)),
-            uri: Arc::new(Mutex::new(None)),
+            session: Arc::new(Mutex::new(None)),
             shell_stdin: Arc::new(tokio::sync::Mutex::new(None)),
             database_tools_install: Arc::new(Mutex::new(())),
             database_tools_last_checked: Arc::new(Mutex::new(None)),
@@ -37,23 +44,23 @@ impl AppState {
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-/// Return a cloned `Client` from shared state, or an error if not connected.
-/// `Client` is `Arc`-backed so cloning is cheap.
-async fn get_client(state: &AppState) -> Result<Client, String> {
-    let guard = state.client.lock().await;
-    guard
-        .as_ref()
+/// The active session, or an error if not connected. The lock is held only for
+/// the clone (`Client` is `Arc`-backed, so cloning is cheap).
+async fn get_session(state: &AppState) -> Result<Session, String> {
+    state
+        .session
+        .lock()
+        .await
+        .clone()
         .ok_or_else(|| "Not connected to MongoDB".to_string())
-        .cloned()
 }
 
-/// Return the active connection URI from shared state.
+async fn get_client(state: &AppState) -> Result<Client, String> {
+    Ok(get_session(state).await?.client)
+}
+
 async fn get_uri(state: &AppState) -> Result<String, String> {
-    let guard = state.uri.lock().await;
-    guard
-        .as_ref()
-        .ok_or_else(|| "Not connected to MongoDB".to_string())
-        .cloned()
+    Ok(get_session(state).await?.uri)
 }
 
 /// Parse a pipeline (Extended JSON array of stage objects) into a `Vec<Document>`.
@@ -136,6 +143,8 @@ async fn stream_subprocess(
 pub struct ConnectionInfo {
     pub version: String,
     pub databases: Vec<String>,
+    /// The connection string with its password masked; the only form the UI shows.
+    pub display_uri: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -169,27 +178,23 @@ pub async fn connect(state: &AppState, uri: String) -> Result<ConnectionInfo, St
         .unwrap_or("unknown")
         .to_string();
 
-    // Store the connected client and URI in global state
-    let mut guard = state.client.lock().await;
-    *guard = Some(client.clone());
-    let mut uri_guard = state.uri.lock().await;
-    *uri_guard = Some(uri.clone());
-
     // Fetch initial list of databases
     let databases = client
         .list_database_names()
         .await
         .map_err(|e| format!("Failed to list databases: {}", e))?;
 
-    Ok(ConnectionInfo { version, databases })
+    // Only a fully working connection replaces the current one; no network call
+    // happens while the lock is held.
+    let display_uri = crate::secrets::redact(&uri);
+    *state.session.lock().await = Some(Session { client, uri });
+
+    Ok(ConnectionInfo { version, databases, display_uri })
 }
 
 // Disconnect the active client
 pub async fn disconnect(state: &AppState) -> Result<(), String> {
-    let mut guard = state.client.lock().await;
-    *guard = None;
-    let mut uri_guard = state.uri.lock().await;
-    *uri_guard = None;
+    *state.session.lock().await = None;
     let mut stdin_guard = state.shell_stdin.lock().await;
     *stdin_guard = None;
     Ok(())
@@ -973,6 +978,77 @@ fn find_executable(name: &str) -> Result<PathBuf, String> {
     ))
 }
 
+/// A private YAML file that hands the connection string to a database tool through
+/// `--config`, so the password never appears in the process list. The file is
+/// readable only by the current user and is removed when this value is dropped.
+struct ToolConfig {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl ToolConfig {
+    fn new(uri: &str) -> Result<Self, String> {
+        use std::io::Write;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = format!(
+            "compass-tools-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let dir = std::env::temp_dir().join(unique);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir).map_err(|e| format!("Failed to prepare tool config: {}", e))?;
+        let config = Self { path: dir.join("config.yaml"), dir };
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&config.path).map_err(|e| format!("Failed to prepare tool config: {}", e))?;
+        // A JSON string is a valid YAML double-quoted scalar.
+        let quoted = serde_json::to_string(uri).map_err(|e| e.to_string())?;
+        writeln!(file, "uri: {}", quoted).map_err(|e| format!("Failed to prepare tool config: {}", e))?;
+        Ok(config)
+    }
+
+    fn arg(&self) -> String {
+        format!("--config={}", self.path.display())
+    }
+}
+
+impl Drop for ToolConfig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Runs a database tool with the connection string passed through a [`ToolConfig`],
+/// or, for a dry run, reports the command with the password masked.
+async fn run_database_tool(
+    app_handle: &tauri::AppHandle,
+    event_name: &str,
+    tool: &str,
+    exec_path: PathBuf,
+    uri: &str,
+    args: Vec<String>,
+    dry_run: bool,
+) -> Result<(), String> {
+    if dry_run {
+        let shown = format!("{} --uri={} {}", tool, crate::secrets::redact(uri), args.join(" "));
+        let _ = app_handle.emit(event_name, LogPayload { text: format!("[Compass+] [DRY RUN] Would execute: {}", shown) });
+        return Ok(());
+    }
+    let config = ToolConfig::new(uri)?;
+    let mut full_args = vec![config.arg()];
+    full_args.extend(args);
+    let result = stream_subprocess(app_handle, event_name, exec_path, full_args).await;
+    drop(config);
+    result
+}
+
 pub async fn run_mongodump(
     app_handle: &tauri::AppHandle,
     state: &AppState,
@@ -998,8 +1074,8 @@ pub async fn run_mongodump(
         crate::database_tools::executable_path(&tools, "mongodump")?
     };
 
-    // Build arguments
-    let mut args = vec![format!("--uri={}", uri)];
+    // Build arguments (the connection string goes through a private config file)
+    let mut args = Vec::new();
     if let Some(db_name) = db {
         if !db_name.trim().is_empty() {
             args.push(format!("--db={}", db_name));
@@ -1025,13 +1101,7 @@ pub async fn run_mongodump(
         }
     }
 
-    if dry_run.unwrap_or(false) {
-        let cmd_str = format!("mongodump {}", args.join(" "));
-        let _ = app_handle.emit("dump-log", LogPayload { text: format!("[Compass+] [DRY RUN] Would execute: {}", cmd_str) });
-        return Ok(());
-    }
-
-    stream_subprocess(app_handle, "dump-log", exec_path, args).await
+    run_database_tool(app_handle, "dump-log", "mongodump", exec_path, &uri, args, dry_run.unwrap_or(false)).await
 }
 
 pub async fn run_mongorestore(
@@ -1060,8 +1130,8 @@ pub async fn run_mongorestore(
         crate::database_tools::executable_path(&tools, "mongorestore")?
     };
 
-    // Build arguments
-    let mut args = vec![format!("--uri={}", uri)];
+    // Build arguments (the connection string goes through a private config file)
+    let mut args = Vec::new();
     if let Some(db_name) = db {
         if !db_name.trim().is_empty() {
             args.push(format!("--db={}", db_name));
@@ -1088,13 +1158,7 @@ pub async fn run_mongorestore(
 
     args.push(in_path);
 
-    if dry_run.unwrap_or(false) {
-        let cmd_str = format!("mongorestore {}", args.join(" "));
-        let _ = app_handle.emit("restore-log", LogPayload { text: format!("[Compass+] [DRY RUN] Would execute: {}", cmd_str) });
-        return Ok(());
-    }
-
-    stream_subprocess(app_handle, "restore-log", exec_path, args).await
+    run_database_tool(app_handle, "restore-log", "mongorestore", exec_path, &uri, args, dry_run.unwrap_or(false)).await
 }
 
 // Fetch MongoDB collection validator options (usually $jsonSchema)
@@ -1334,8 +1398,10 @@ pub async fn start_shell(
     let mut stdin_guard = state.shell_stdin.lock().await;
     *stdin_guard = None;
 
+    // Start without a connection and connect from stdin, so the connection string
+    // (with its password) never appears in the process list.
     let mut child = Command::new(exec_path)
-        .arg(&uri)
+        .arg("--nodb")
         .arg("--norc")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1343,7 +1409,14 @@ pub async fn start_shell(
         .spawn()
         .map_err(|e| format!("Failed to spawn mongosh: {}", e))?;
 
-    let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+    let mut stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+    {
+        use tokio::io::AsyncWriteExt;
+        // `void` keeps mongosh from printing the result of the assignment.
+        let connect = format!("void (db = connect({}))\n", serde_json::to_string(&uri).map_err(|e| e.to_string())?);
+        stdin.write_all(connect.as_bytes()).await.map_err(|e| format!("Failed to start mongosh: {}", e))?;
+        stdin.flush().await.map_err(|e| format!("Failed to start mongosh: {}", e))?;
+    }
     *stdin_guard = Some(stdin);
 
     let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
@@ -1772,6 +1845,40 @@ mod tests {
         .await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("Not connected to MongoDB"));
+    }
+
+    #[test]
+    fn tool_config_is_private_and_removed_after_use() {
+        let uri = r#"mongodb://u:p%40"ss@h/?authSource=admin"#;
+        let config = ToolConfig::new(uri).unwrap();
+        let path = config.path.clone();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "uri: \"mongodb://u:p%40\\\"ss@h/?authSource=admin\"\n");
+        assert!(!config.arg().contains("p%40"), "the password must not be on the command line");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        drop(config);
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    /// mongodump reads the connection string from the config file. Needs a server
+    /// with authentication: COMPASS_IT_AUTH_URI=mongodb://user:pass@host/?authSource=admin
+    #[test]
+    fn mongodump_connects_through_tool_config() {
+        let Ok(uri) = std::env::var("COMPASS_IT_AUTH_URI") else { return };
+        let Ok(exec) = find_executable("mongodump") else { return };
+        let config = ToolConfig::new(&uri).unwrap();
+        let out = std::env::temp_dir().join(format!("compass-it-dump-{}", std::process::id()));
+        let status = std::process::Command::new(exec)
+            .args([config.arg(), "--db=admin".into(), "--collection=system.version".into(), format!("--out={}", out.display())])
+            .status()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&out);
+        assert!(status.success());
     }
 
     #[test]

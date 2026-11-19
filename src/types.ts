@@ -1,6 +1,8 @@
 export interface ConnectionInfo {
   version: string;
   databases: string[];
+  /** Connection string with the password masked; the full URI stays in the backend. */
+  display_uri: string;
 }
 
 export interface DocumentListResult {
@@ -48,7 +50,10 @@ export interface TabState {
 export interface ConnectionPreset {
   id: string;
   name: string;
+  /** Never contains a password: that lives in the OS credential store under `id`. */
   uri: string;
+  /** A password for this connection is in the OS credential store. */
+  hasPassword?: boolean;
   color: string; // Environment color-code
   createdAt: string;
 }

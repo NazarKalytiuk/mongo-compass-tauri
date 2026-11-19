@@ -15,13 +15,35 @@ test.describe("Connection Workflow (E2E)", () => {
           if (cmd === "plugin:event|unlisten") {
             return null;
           }
+          // Connection passwords: the fake credential store mirrors src-tauri/src/secrets.rs.
+          const vault: Map<string, string> = ((window as any).__vault ??= new Map());
+          const split = (uri: string): [string, string | null] => {
+            const m = /^(mongodb(?:\+srv)?:\/\/[^:@/?]*):([^@/?]*)@/.exec(uri);
+            return m ? [uri.replace(`${m[1]}:${m[2]}@`, `${m[1]}@`), m[2]] : [uri, null];
+          };
+          if (cmd === "strip_password") return split(args.uri)[0];
+          if (cmd === "save_connection_password") {
+            const [stripped, password] = split(args.uri);
+            if (password !== null) vault.set(args.connectionId, password);
+            return stripped;
+          }
+          if (cmd === "delete_connection_password") {
+            vault.delete(args.connectionId);
+            return null;
+          }
           if (cmd === "connect_db") {
             if (args.uri.includes("invalid")) {
               throw new Error("DNS resolution failed for hostname");
             }
+            const [stripped, password] = split(args.uri);
+            const saved = args.connectionId ? vault.get(args.connectionId) : undefined;
+            if (stripped.includes("@") && password === null && saved === undefined) {
+              throw new Error("Authentication failed.");
+            }
             return {
               version: "8.0.0",
               databases: ["admin", "local", "users_db"],
+              display_uri: args.uri.replace(/:([^@/?]*)@/, ":****@"),
             };
           }
           if (cmd === "diagnose_uri") {
@@ -166,7 +188,7 @@ test.describe("Connection Workflow (E2E)", () => {
     await nameInput.fill("Test E2E Preset");
 
     const uriInput = page.locator("#connection-uri-input");
-    await uriInput.fill("mongodb://e2e-test-host:27017");
+    await uriInput.fill("mongodb://e2e:s3cret@e2e-test-host:27017");
 
     // Click staging button to change color
     await page.click("button:has-text('Staging')");
@@ -179,13 +201,18 @@ test.describe("Connection Workflow (E2E)", () => {
     await page.click("button[title='Disconnect']");
     await expect(page.locator("text=Connect to Database")).toBeVisible();
 
-    // 4. Verify new preset is in sidebar
+    // 4. Verify new preset is in sidebar, without its password anywhere in storage
     await expect(page.locator("text=Test E2E Preset")).toBeVisible();
-    await expect(page.locator("text=mongodb://e2e-test-host:27017")).toBeVisible();
+    await expect(page.locator("text=mongodb://e2e@e2e-test-host:27017")).toBeVisible();
+    await expect(page.getByLabel("Password saved in the system keychain")).toBeVisible();
+    expect(await page.evaluate(() => localStorage.getItem("mongo_compass_presets"))).not.toContain("s3cret");
 
-    // 5. Select preset and verify fields update
+    // 5. Select preset: the URI has no password, and connecting uses the stored one
     await page.click("text=Test E2E Preset");
-    await expect(uriInput).toHaveValue("mongodb://e2e-test-host:27017");
+    await expect(uriInput).toHaveValue("mongodb://e2e@e2e-test-host:27017");
+    await page.click("button:has-text('Connect')");
+    await expect(page.locator("text=Welcome to Compass+")).toBeVisible();
+    await page.click("button[title='Disconnect']");
 
     // 6. Delete the preset
     const deleteBtn = page.getByRole("button", { name: "Delete preset Test E2E Preset" });

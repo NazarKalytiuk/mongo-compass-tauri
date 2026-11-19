@@ -7,25 +7,21 @@ import "./App.css";
 export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [connectionInfo, setConnectionInfo] = useState<ConnectionInfo | null>(null);
-  const [uri, setUri] = useState("");
-
-  const handleConnected = (info: ConnectionInfo, connectionUri: string) => {
+  const handleConnected = (info: ConnectionInfo) => {
     setConnectionInfo(info);
-    setUri(connectionUri);
     setIsConnected(true);
   };
 
   const handleDisconnect = () => {
     setIsConnected(false);
     setConnectionInfo(null);
-    setUri("");
   };
 
   if (isConnected && connectionInfo) {
     return (
       <HomeView
         connectionInfo={connectionInfo}
-        uri={uri}
+        uri={connectionInfo.display_uri}
         onDisconnect={handleDisconnect}
       />
     );

@@ -6,10 +6,10 @@ import { ConnectionInfo } from "../../types";
 // ── Mock child components ──────────────────────────────────────────────────────
 
 // ConnectView receives onConnected — expose a handle so tests can fire it
-let capturedOnConnected: ((info: ConnectionInfo, uri: string) => void) | null = null;
+let capturedOnConnected: ((info: ConnectionInfo) => void) | null = null;
 
 vi.mock("../ConnectView", () => ({
-  default: ({ onConnected }: { onConnected: (info: ConnectionInfo, uri: string) => void }) => {
+  default: ({ onConnected }: { onConnected: (info: ConnectionInfo) => void }) => {
     capturedOnConnected = onConnected;
     return <div data-testid="connect-view">ConnectView</div>;
   },
@@ -61,26 +61,28 @@ describe("App", () => {
     const mockInfo: ConnectionInfo = {
       version: "7.0.0",
       databases: ["admin", "local"],
+      display_uri: "mongodb://localhost:27017",
     };
 
     await act(async () => {
-      capturedOnConnected!(mockInfo, "mongodb://localhost:27017");
+      capturedOnConnected!(mockInfo);
     });
 
     expect(screen.queryByTestId("connect-view")).not.toBeInTheDocument();
     expect(screen.getByTestId("home-view")).toBeInTheDocument();
   });
 
-  it("passes the connection URI to HomeView", async () => {
+  it("passes the masked connection URI from the backend to HomeView", async () => {
     render(<App />);
 
     const mockInfo: ConnectionInfo = {
       version: "8.0.0",
       databases: ["mydb"],
+      display_uri: "mongodb://prod-server:27017",
     };
 
     await act(async () => {
-      capturedOnConnected!(mockInfo, "mongodb://prod-server:27017");
+      capturedOnConnected!(mockInfo);
     });
 
     expect(screen.getByText(/uri=mongodb:\/\/prod-server:27017/)).toBeInTheDocument();
@@ -92,10 +94,11 @@ describe("App", () => {
     const mockInfo: ConnectionInfo = {
       version: "6.0.5",
       databases: [],
+      display_uri: "mongodb://host:27017",
     };
 
     await act(async () => {
-      capturedOnConnected!(mockInfo, "mongodb://host:27017");
+      capturedOnConnected!(mockInfo);
     });
 
     expect(screen.getByText(/version=6\.0\.5/)).toBeInTheDocument();
@@ -107,10 +110,11 @@ describe("App", () => {
     const mockInfo: ConnectionInfo = {
       version: "7.0.0",
       databases: ["admin"],
+      display_uri: "mongodb://localhost:27017",
     };
 
     await act(async () => {
-      capturedOnConnected!(mockInfo, "mongodb://localhost:27017");
+      capturedOnConnected!(mockInfo);
     });
 
     // Confirm we are now in HomeView
@@ -130,10 +134,7 @@ describe("App", () => {
     render(<App />);
 
     await act(async () => {
-      capturedOnConnected!(
-        { version: "8.0.0", databases: ["admin"] },
-        "mongodb://prod:27017"
-      );
+      capturedOnConnected!({ version: "8.0.0", databases: ["admin"], display_uri: "mongodb://prod:27017" });
     });
 
     expect(screen.getByText(/prod/)).toBeInTheDocument();
@@ -152,7 +153,7 @@ describe("App", () => {
 
     // Connect
     await act(async () => {
-      capturedOnConnected!({ version: "7.0.0", databases: [] }, "mongodb://host1:27017");
+      capturedOnConnected!({ version: "7.0.0", databases: [], display_uri: "mongodb://host1:27017" });
     });
     expect(screen.getByTestId("home-view")).toBeInTheDocument();
 
@@ -164,7 +165,7 @@ describe("App", () => {
 
     // Reconnect with new info
     await act(async () => {
-      capturedOnConnected!({ version: "9.0.0", databases: ["newdb"] }, "mongodb://host2:27017");
+      capturedOnConnected!({ version: "9.0.0", databases: ["newdb"], display_uri: "mongodb://host2:27017" });
     });
     expect(screen.getByTestId("home-view")).toBeInTheDocument();
     expect(screen.getByText(/version=9\.0\.0/)).toBeInTheDocument();

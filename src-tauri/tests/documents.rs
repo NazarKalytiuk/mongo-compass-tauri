@@ -150,3 +150,39 @@ async fn inserts_and_filters_use_extended_json_types() {
     assert_eq!(hits.len(), 2);
     db.drop().await;
 }
+
+/// Saved-connection passwords go through the OS credential store. Touches the real
+/// store, so it runs only with COMPASS_IT_KEYCHAIN=1 and COMPASS_IT_AUTH_URI set to a
+/// server with authentication (mongodb://user:pass@host/?authSource=admin).
+#[tokio::test]
+async fn saved_connection_password_round_trips_through_the_credential_store() {
+    if std::env::var("COMPASS_IT_KEYCHAIN").as_deref() != Ok("1") {
+        return;
+    }
+    let Ok(uri) = std::env::var("COMPASS_IT_AUTH_URI") else { return };
+    use mongo_compass_tauri_lib::secrets;
+    /// Removes the test entry from the credential store however the test ends.
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = secrets::delete(&self.0);
+        }
+    }
+    let id = format!("compass-it-{}", std::process::id());
+    let _cleanup = Cleanup(id.clone());
+
+    let (stripped, password) = secrets::split_password(&uri);
+    let password = password.expect("COMPASS_IT_AUTH_URI must contain a password");
+    secrets::store(&id, &password).unwrap();
+    let state = mongo::AppState::new();
+    // Without the stored password the server rejects the login...
+    assert!(mongo::connect(&state, stripped.clone()).await.is_err());
+    // ...with it filled in from the store, it connects, and the UI only sees a masked URI.
+    let info = mongo::connect(&state, secrets::resolve(&stripped, Some(&id)).unwrap()).await.expect("connect");
+    assert!(!info.display_uri.contains(&password), "{}", info.display_uri);
+    assert!(info.display_uri.contains(":****@"), "{}", info.display_uri);
+
+    secrets::delete(&id).unwrap();
+    assert_eq!(secrets::load(&id).unwrap(), None);
+    assert_eq!(secrets::resolve(&stripped, Some(&id)).unwrap(), stripped);
+}

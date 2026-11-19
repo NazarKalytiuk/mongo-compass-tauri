@@ -31,3 +31,4 @@ sha2 = "0.10"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"
+keyring = "4"

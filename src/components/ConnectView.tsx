@@ -1,11 +1,13 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ConnectionPreset, ConnectionInfo } from "../types";
-import { Database, Trash2, Link2, AlertCircle } from "lucide-react";
+import { Database, Trash2, Link2, AlertCircle, KeyRound } from "lucide-react";
 
 interface ConnectViewProps {
-  onConnected: (info: ConnectionInfo, uri: string) => void;
+  onConnected: (info: ConnectionInfo) => void;
 }
+
+const PRESETS_KEY = "mongo_compass_presets";
 
 const DEFAULT_PRESETS: ConnectionPreset[] = [
   {
@@ -41,20 +43,87 @@ export default function ConnectView({ onConnected }: ConnectViewProps) {
   const [savePreset, setSavePreset] = useState(true);
   const [selectedEnvFilter, setSelectedEnvFilter] = useState("All");
 
-  // Load presets from localStorage
+  // Saved connection selected in the sidebar; its stored password is used when the
+  // URI field still shows that connection's URI.
+  const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+
+  const persistPresets = (list: ConnectionPreset[]) => {
+    setPresets(list);
+    localStorage.setItem(PRESETS_KEY, JSON.stringify(list));
+  };
+
+  // Load presets from localStorage. Passwords still embedded in saved URIs (from
+  // older versions) are then moved into the OS credential store in the background.
   useEffect(() => {
-    const saved = localStorage.getItem("mongo_compass_presets");
-    if (saved) {
-      try {
-        setPresets(JSON.parse(saved));
-      } catch (e) {
-        setPresets(DEFAULT_PRESETS);
+    let loaded: ConnectionPreset[] = DEFAULT_PRESETS;
+    try {
+      const parsed = JSON.parse(localStorage.getItem(PRESETS_KEY) ?? "null");
+      if (Array.isArray(parsed)) {
+        loaded = parsed.filter((p) => p && typeof p.id === "string" && typeof p.uri === "string");
       }
-    } else {
-      setPresets(DEFAULT_PRESETS);
-      localStorage.setItem("mongo_compass_presets", JSON.stringify(DEFAULT_PRESETS));
+    } catch {
+      // Corrupt storage: fall back to the defaults.
     }
+    if (localStorage.getItem(PRESETS_KEY) === null) persistPresets(loaded);
+    else setPresets(loaded);
+
+    let cancelled = false;
+    (async () => {
+      const strippedById = new Map<string, string>();
+      for (const preset of loaded) {
+        try {
+          const stripped = await invoke<string>("save_connection_password", { connectionId: preset.id, uri: preset.uri });
+          if (stripped !== preset.uri) strippedById.set(preset.id, stripped);
+        } catch (err) {
+          console.error(`Could not move the password of "${preset.name}" to the credential store:`, err);
+        }
+      }
+      if (cancelled || strippedById.size === 0) return;
+      // Apply to the current list, which the user may have changed meanwhile.
+      setPresets((current) => {
+        const next = current.map((p) => {
+          const stripped = strippedById.get(p.id);
+          return stripped === undefined ? p : { ...p, uri: stripped, hasPassword: true };
+        });
+        localStorage.setItem(PRESETS_KEY, JSON.stringify(next));
+        return next;
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  /** Saves a successful connection; its password goes to the credential store. */
+  const rememberConnection = async (targetUri: string) => {
+    const stripped = await invoke<string>("strip_password", { uri: targetUri });
+    const existing = presets.find((p) => p.uri === stripped);
+    const id = existing?.id ?? Math.random().toString(36).substring(7);
+    const typedPassword = stripped !== targetUri;
+    if (typedPassword) {
+      await invoke<string>("save_connection_password", { connectionId: id, uri: targetUri });
+    }
+    if (existing) {
+      if (typedPassword && !existing.hasPassword) {
+        persistPresets(presets.map((p) => (p.id === id ? { ...p, hasPassword: true } : p)));
+      }
+      return;
+    }
+    const newPreset: ConnectionPreset = {
+      id,
+      name: name || "MongoDB Connection",
+      uri: stripped,
+      hasPassword: typedPassword,
+      color: envColor,
+      createdAt: new Date().toISOString(),
+    };
+    const updated = [newPreset, ...presets];
+    // Keep 15 connections; forget the passwords of the ones that fall off.
+    for (const dropped of updated.slice(15)) {
+      invoke("delete_connection_password", { connectionId: dropped.id }).catch(console.error);
+    }
+    persistPresets(updated.slice(0, 15));
+  };
 
   const handleConnect = async (targetUri: string) => {
     setLoading(true);
@@ -70,30 +139,23 @@ export default function ConnectView({ onConnected }: ConnectViewProps) {
       setDiagStep("Authenticating credentials & running handshake...");
     }, 1800);
 
+    const connectionId = presets.find((p) => p.id === selectedPresetId && p.uri === targetUri)?.id ?? null;
     try {
-      const res: ConnectionInfo = await invoke("connect_db", { uri: targetUri });
+      const res: ConnectionInfo = await invoke("connect_db", { uri: targetUri, connectionId });
       clearTimeout(diagTimer);
       clearTimeout(diagTimer2);
       setDiagStep(null);
       
-      // Save preset if it's new and savePreset is checked
       if (savePreset) {
-        const exists = presets.find((p) => p.uri === targetUri);
-        if (!exists) {
-          const newPreset: ConnectionPreset = {
-            id: Math.random().toString(36).substring(7),
-            name: name || "MongoDB Connection",
-            uri: targetUri,
-            color: envColor,
-            createdAt: new Date().toISOString(),
-          };
-          const updated = [newPreset, ...presets].slice(0, 15);
-          setPresets(updated);
-          localStorage.setItem("mongo_compass_presets", JSON.stringify(updated));
+        try {
+          await rememberConnection(targetUri);
+        } catch (err) {
+          // Connected anyway; the connection is just not saved.
+          console.error("Could not save the connection:", err);
         }
       }
       
-      onConnected(res, targetUri);
+      onConnected(res);
     } catch (err) {
       clearTimeout(diagTimer);
       clearTimeout(diagTimer2);
@@ -103,7 +165,7 @@ export default function ConnectView({ onConnected }: ConnectViewProps) {
       // Trigger diagnostics
       setDiagnosing(true);
       try {
-        const diagRes = await invoke<any>("diagnose_uri", { uri: targetUri });
+        const diagRes = await invoke<any>("diagnose_uri", { uri: targetUri, connectionId });
         setDiagnostics(diagRes);
       } catch (diagErr) {
         console.error("Failed to run diagnostics:", diagErr);
@@ -117,9 +179,11 @@ export default function ConnectView({ onConnected }: ConnectViewProps) {
 
   const deletePreset = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    const updated = presets.filter((p) => p.id !== id);
-    setPresets(updated);
-    localStorage.setItem("mongo_compass_presets", JSON.stringify(updated));
+    persistPresets(presets.filter((p) => p.id !== id));
+    if (selectedPresetId === id) setSelectedPresetId(null);
+    invoke("delete_connection_password", { connectionId: id }).catch((err) =>
+      console.error("Could not remove the saved password:", err)
+    );
   };
 
   // Filter presets by active environment
@@ -187,6 +251,7 @@ export default function ConnectView({ onConnected }: ConnectViewProps) {
                   key={preset.id}
                   onClick={() => {
                     setUri(preset.uri);
+                    setSelectedPresetId(preset.id);
                     setName(preset.name);
                     setEnvColor(preset.color);
                   }}
@@ -198,8 +263,14 @@ export default function ConnectView({ onConnected }: ConnectViewProps) {
                       <h3 className="text-xs font-semibold truncate text-[#111827]">
                         {preset.name}
                       </h3>
-                      <p className="text-[10px] text-[#5B6472] truncate">
-                        {preset.uri}
+                      <p className="flex items-center gap-1 text-[10px] text-[#5B6472] truncate">
+                        {preset.hasPassword && (
+                          <KeyRound
+                            className="w-3 h-3 shrink-0 text-[#8A93A2]"
+                            aria-label="Password saved in the system keychain"
+                          />
+                        )}
+                        <span className="truncate">{preset.uri}</span>
                       </p>
                     </div>
                   </div>

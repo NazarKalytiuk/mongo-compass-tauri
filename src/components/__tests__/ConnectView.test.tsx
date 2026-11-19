@@ -8,9 +8,53 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
+
+/** Saved-connection passwords held by the fake credential store, by connection id. */
+const vault = new Map<string, string>();
+
+/** Mirrors src-tauri/src/secrets.rs `split_password`. */
+function splitPassword(uri: string): [string, string | null] {
+  const m = /^(mongodb(?:\+srv)?:\/\/[^:@/?]*):([^@/?]*)@/.exec(uri);
+  return m ? [uri.replace(`${m[1]}:${m[2]}@`, `${m[1]}@`), m[2]!] : [uri, null];
+}
+
+/**
+ * Fake backend: the connection-password commands behave like the real ones;
+ * everything else goes to `impl`.
+ */
+function mockBackend(impl: (cmd: string, args: any) => unknown = () => null) {
+  vi.mocked(invoke).mockImplementation(async (cmd: string, args: any) => {
+    switch (cmd) {
+      case "strip_password":
+        return splitPassword(args.uri)[0];
+      case "save_connection_password": {
+        const [stripped, password] = splitPassword(args.uri);
+        if (password !== null) vault.set(args.connectionId, password);
+        return stripped;
+      }
+      case "delete_connection_password":
+        vault.delete(args.connectionId);
+        return null;
+      default:
+        return impl(cmd, args);
+    }
+  });
+}
+
+const connected = (info: object) => mockBackend((cmd) => (cmd === "connect_db" ? info : null));
+
+/** Lets chains of awaited invoke calls settle (timers are faked in this suite). */
+async function settle() {
+  await act(async () => {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  });
+}
+
 describe("ConnectView", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    vault.clear();
+    mockBackend();
     vi.useFakeTimers();
     // Clear localStorage preset history
     localStorage.clear();
@@ -33,7 +77,7 @@ describe("ConnectView", () => {
     };
 
     // Mock successful database connection
-    vi.mocked(invoke).mockResolvedValue(mockConnectionInfo);
+    connected(mockConnectionInfo);
 
     render(<ConnectView onConnected={mockOnConnected} />);
 
@@ -45,17 +89,14 @@ describe("ConnectView", () => {
     expect(screen.getByText("DNS lookup & DNS SRV resolution...")).toBeInTheDocument();
 
     // Resolve promise
-    await act(async () => {
-      // Allow async code to finish
-      await Promise.resolve();
-    });
+    await settle();
 
-    expect(invoke).toHaveBeenCalledWith("connect_db", { uri: "mongodb://localhost:27017" });
-    expect(mockOnConnected).toHaveBeenCalledWith(mockConnectionInfo, "mongodb://localhost:27017");
+    expect(invoke).toHaveBeenCalledWith("connect_db", { uri: "mongodb://localhost:27017", connectionId: null });
+    expect(mockOnConnected).toHaveBeenCalledWith(mockConnectionInfo);
   });
 
   it("displays timed diagnostics phases when connection takes time", async () => {
-    vi.mocked(invoke).mockReturnValue(new Promise(() => {})); // Never resolves to keep loading active
+    mockBackend((cmd) => (cmd === "connect_db" ? new Promise(() => {}) : null)); // Never resolves to keep loading active
 
     render(<ConnectView onConnected={() => {}} />);
 
@@ -80,7 +121,9 @@ describe("ConnectView", () => {
 
   it("displays error banner when connection fails", async () => {
     const errorMsg = "Auth failed: Authentication failed.";
-    vi.mocked(invoke).mockRejectedValue(errorMsg);
+    mockBackend(() => {
+      throw errorMsg;
+    });
 
     render(<ConnectView onConnected={() => {}} />);
 
@@ -88,9 +131,7 @@ describe("ConnectView", () => {
     fireEvent.click(connectBtn);
 
     // Resolve promise with rejection
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await settle();
 
     // Check if error is displayed
     expect(screen.getByText(new RegExp(errorMsg))).toBeInTheDocument();
@@ -163,7 +204,7 @@ describe("ConnectView", () => {
 
   it("displays diagnostics report when connection fails", async () => {
     const errorMsg = "Connection failed.";
-    vi.mocked(invoke).mockImplementation(async (cmd, _args: any) => {
+    mockBackend(async (cmd) => {
       if (cmd === "connect_db") {
         throw new Error(errorMsg);
       }
@@ -187,15 +228,10 @@ describe("ConnectView", () => {
     const connectBtn = screen.getByRole("button", { name: "Connect" });
     fireEvent.click(connectBtn);
 
-    await act(async () => {
-      // wait for connect_db promise rejection
-      await Promise.resolve();
-    });
+    await settle();
 
     // wait for diagnose_uri promise to resolve
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await settle();
 
     expect(screen.getByText("Connection Diagnostics Report")).toBeInTheDocument();
     expect(screen.getByText("1. URI Syntax Check")).toBeInTheDocument();
@@ -251,7 +287,7 @@ describe("ConnectView", () => {
 
   it("respects the save Preset checkbox and does not save connection when unchecked", async () => {
     const mockOnConnected = vi.fn();
-    vi.mocked(invoke).mockResolvedValue({
+    connected({
       version: "8.0.0",
       databases: ["admin"],
     });
@@ -269,9 +305,7 @@ describe("ConnectView", () => {
     const connectBtn = screen.getByRole("button", { name: "Connect" });
     fireEvent.click(connectBtn);
 
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await settle();
 
     // Preset should not be in localStorage (except default Local MongoDB if set by default)
     const stored = JSON.parse(localStorage.getItem("mongo_compass_presets") || "[]");
@@ -292,7 +326,7 @@ describe("ConnectView", () => {
   it("saves a new preset to localStorage on successful connect with a non-duplicate URI", async () => {
     // Line 92 branch: savePreset=true, URI does not already exist in presets
     const mockOnConnected = vi.fn();
-    vi.mocked(invoke).mockResolvedValue({ version: "8.0.0", databases: [] });
+    connected({ version: "8.0.0", databases: [] });
 
     render(<ConnectView onConnected={mockOnConnected} />);
 
@@ -303,9 +337,7 @@ describe("ConnectView", () => {
     const connectBtn = screen.getByRole("button", { name: "Connect" });
     fireEvent.click(connectBtn);
 
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await settle();
 
     const stored = JSON.parse(localStorage.getItem("mongo_compass_presets") || "[]");
     expect(stored.some((p: any) => p.uri === "mongodb://newhost:27017")).toBe(true);
@@ -324,7 +356,7 @@ describe("ConnectView", () => {
     ];
     localStorage.setItem("mongo_compass_presets", JSON.stringify(existingPresets));
 
-    vi.mocked(invoke).mockResolvedValue({ version: "8.0.0", databases: [] });
+    connected({ version: "8.0.0", databases: [] });
 
     render(<ConnectView onConnected={mockOnConnected} />);
 
@@ -332,9 +364,7 @@ describe("ConnectView", () => {
     const connectBtn = screen.getByRole("button", { name: "Connect" });
     fireEvent.click(connectBtn);
 
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await settle();
 
     const stored = JSON.parse(localStorage.getItem("mongo_compass_presets") || "[]");
     const dupes = stored.filter((p: any) => p.uri === "mongodb://localhost:27017");
@@ -380,7 +410,7 @@ describe("ConnectView", () => {
 
   it("falls back to showing diagnostics error if diagnose_uri invoke also fails", async () => {
     // Line 108-110: catch in the diagnose_uri call
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
+    mockBackend(async (cmd) => {
       if (cmd === "connect_db") throw new Error("Connection refused");
       if (cmd === "diagnose_uri") throw new Error("Diagnostics unavailable");
       return null;
@@ -393,8 +423,8 @@ describe("ConnectView", () => {
     const connectBtn = screen.getByRole("button", { name: "Connect" });
     fireEvent.click(connectBtn);
 
-    await act(async () => { await Promise.resolve(); });
-    await act(async () => { await Promise.resolve(); });
+    await settle();
+    await settle();
 
     // Error banner should be shown for the original connection failure
     expect(screen.getByText(/Connection refused/)).toBeInTheDocument();
@@ -409,7 +439,7 @@ describe("ConnectView", () => {
 
   it("uses 'MongoDB Connection' as fallback name when name field is empty on save", async () => {
     // Line 85: name || "MongoDB Connection" fallback
-    vi.mocked(invoke).mockResolvedValue({ version: "8.0.0", databases: [] });
+    connected({ version: "8.0.0", databases: [] });
 
     render(<ConnectView onConnected={() => {}} />);
 
@@ -424,7 +454,7 @@ describe("ConnectView", () => {
     const connectBtn = screen.getByRole("button", { name: "Connect" });
     fireEvent.click(connectBtn);
 
-    await act(async () => { await Promise.resolve(); });
+    await settle();
 
     const stored = JSON.parse(localStorage.getItem("mongo_compass_presets") || "[]");
     const saved = stored.find((p: any) => p.uri === "mongodb://empty-name:27017");
@@ -434,7 +464,7 @@ describe("ConnectView", () => {
 
   it("shows diagnostics skipped step marker for steps with 'skipped' in error text", async () => {
     // Line 290-299: isSkipped branch in diagnostics report
-    vi.mocked(invoke).mockImplementation(async (cmd) => {
+    mockBackend(async (cmd) => {
       if (cmd === "connect_db") throw new Error("fail");
       if (cmd === "diagnose_uri") {
         return {
@@ -455,8 +485,8 @@ describe("ConnectView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Connect" }));
 
-    await act(async () => { await Promise.resolve(); });
-    await act(async () => { await Promise.resolve(); });
+    await settle();
+    await settle();
 
     expect(screen.getByText("Connection Diagnostics Report")).toBeInTheDocument();
     expect(screen.getByText("skipped due to parse error")).toBeInTheDocument();
@@ -490,5 +520,82 @@ describe("ConnectView", () => {
 
     expect(screen.getByText("Prod Database")).toBeInTheDocument();
     expect(screen.queryByText("Custom Color DB")).not.toBeInTheDocument();
+  });
+
+  // ── Passwords live in the OS credential store, never in localStorage ─────────
+
+  describe("connection passwords", () => {
+    const info = { version: "8.0.0", databases: [], display_uri: "mongodb://alice:****@db:27017" };
+    const stored = () => JSON.parse(localStorage.getItem("mongo_compass_presets") || "[]");
+
+    it("moves passwords saved by older versions into the credential store", async () => {
+      localStorage.setItem(
+        "mongo_compass_presets",
+        JSON.stringify([{ id: "old", name: "Old Prod", uri: "mongodb://alice:s3cret@db:27017/app", color: "#DC2626", createdAt: "" }])
+      );
+      render(<ConnectView onConnected={() => {}} />);
+      await settle();
+
+      expect(vault.get("old")).toBe("s3cret");
+      expect(stored()).toEqual([expect.objectContaining({ id: "old", uri: "mongodb://alice@db:27017/app", hasPassword: true })]);
+      expect(localStorage.getItem("mongo_compass_presets")).not.toContain("s3cret");
+      expect(screen.getByText("mongodb://alice@db:27017/app")).toBeInTheDocument();
+      expect(screen.getByLabelText("Password saved in the system keychain")).toBeInTheDocument();
+    });
+
+    it("saves a typed password to the credential store and only the bare URI to localStorage", async () => {
+      const onConnected = vi.fn();
+      connected(info);
+      render(<ConnectView onConnected={onConnected} />);
+      fireEvent.change(screen.getByLabelText("Connection URI String"), { target: { value: "mongodb://alice:s3cret@db:27017" } });
+      fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+      await settle();
+
+      expect(invoke).toHaveBeenCalledWith("connect_db", { uri: "mongodb://alice:s3cret@db:27017", connectionId: null });
+      const saved = stored().find((p: any) => p.uri === "mongodb://alice@db:27017");
+      expect(saved).toEqual(expect.objectContaining({ hasPassword: true }));
+      expect(vault.get(saved.id)).toBe("s3cret");
+      expect(localStorage.getItem("mongo_compass_presets")).not.toContain("s3cret");
+      expect(onConnected).toHaveBeenCalledWith(info);
+    });
+
+    it("connects a saved connection by id so the backend fills in its password", async () => {
+      localStorage.setItem(
+        "mongo_compass_presets",
+        JSON.stringify([{ id: "prod", name: "Prod", uri: "mongodb://alice@db:27017", hasPassword: true, color: "#DC2626", createdAt: "" }])
+      );
+      connected(info);
+      render(<ConnectView onConnected={() => {}} />);
+      fireEvent.click(screen.getByText("Prod"));
+      fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+      await settle();
+      expect(invoke).toHaveBeenCalledWith("connect_db", { uri: "mongodb://alice@db:27017", connectionId: "prod" });
+    });
+
+    it("does not use a saved password once the URI is edited", async () => {
+      localStorage.setItem(
+        "mongo_compass_presets",
+        JSON.stringify([{ id: "prod", name: "Prod", uri: "mongodb://alice@db:27017", hasPassword: true, color: "#DC2626", createdAt: "" }])
+      );
+      connected(info);
+      render(<ConnectView onConnected={() => {}} />);
+      fireEvent.click(screen.getByText("Prod"));
+      fireEvent.change(screen.getByLabelText("Connection URI String"), { target: { value: "mongodb://alice@other:27017" } });
+      fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+      await settle();
+      expect(invoke).toHaveBeenCalledWith("connect_db", { uri: "mongodb://alice@other:27017", connectionId: null });
+    });
+
+    it("forgets the stored password when a saved connection is deleted", async () => {
+      vault.set("prod", "s3cret");
+      localStorage.setItem(
+        "mongo_compass_presets",
+        JSON.stringify([{ id: "prod", name: "Prod", uri: "mongodb://alice@db:27017", hasPassword: true, color: "#DC2626", createdAt: "" }])
+      );
+      render(<ConnectView onConnected={() => {}} />);
+      fireEvent.click(screen.getByRole("button", { name: "Delete preset Prod" }));
+      await settle();
+      expect(vault.has("prod")).toBe(false);
+    });
   });
 });
