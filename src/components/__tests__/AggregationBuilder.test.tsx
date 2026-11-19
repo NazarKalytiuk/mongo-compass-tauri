@@ -341,6 +341,38 @@ describe("AggregationBuilder", () => {
     expect(await screen.findByText(/JSON parse error/)).toBeInTheDocument();
   });
 
+  it("runs one preview for a burst of edits, with the last text", async () => {
+    render(<AggregationBuilder dbName="store_db" collName="products" />);
+    await screen.findByText(/Aggregated Product/);
+    vi.mocked(invoke).mockClear();
+
+    const textarea = screen.getByPlaceholderText("e.g. { }");
+    for (const value of ['{ "a": 1 }', '{ "a": 2 }', '{ "a": 3 }']) {
+      fireEvent.change(textarea, { target: { value } });
+    }
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("aggregate_documents", expect.anything()));
+    const previews = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "aggregate_documents");
+    expect(previews).toHaveLength(1);
+    expect(JSON.parse((previews[0]![1] as { pipelineStr: string }).pipelineStr)).toEqual([{ $match: { a: 3 } }]);
+  });
+
+  it("does not run a pending preview after unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      const { unmount } = render(<AggregationBuilder dbName="store_db" collName="products" />);
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+      vi.mocked(invoke).mockClear();
+      fireEvent.change(screen.getByPlaceholderText("e.g. { }"), { target: { value: '{ "a": 1 }' } });
+      unmount();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(invoke).not.toHaveBeenCalledWith("aggregate_documents", expect.anything());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shows 'No documents generated' when aggregate returns empty array", async () => {
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       if (cmd === "find_documents") return { documents: [], total_count: 0 };

@@ -442,6 +442,19 @@ export default function AggregationBuilder({ dbName, collName, tab, serverVersio
   // Imperative handles to each stage's editor, for "Insert Template".
   const editorRefs = useRef<Record<string, CodeEditorHandle | null>>({});
 
+  // Stage previews re-run shortly after edits. Rapid edits share one run, which
+  // starts from the earliest edited stage and reads the latest committed stages.
+  const stagesRef = useRef(stages);
+  stagesRef.current = stages;
+  const previewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previewFrom = useRef(Number.POSITIVE_INFINITY);
+  useEffect(
+    () => () => {
+      if (previewTimer.current) clearTimeout(previewTimer.current);
+    },
+    []
+  );
+
   const insertTextAtCursor = (stageIndex: number, textToInsert: string) => {
     const stageId = stages[stageIndex]?.id;
     editorRefs.current[stageId]?.insertAtCursor(textToInsert);
@@ -478,13 +491,22 @@ export default function AggregationBuilder({ dbName, collName, tab, serverVersio
     }
   };
 
+  const schedulePreviewsFrom = (index: number) => {
+    previewFrom.current = Math.min(previewFrom.current, index);
+    if (previewTimer.current) clearTimeout(previewTimer.current);
+    previewTimer.current = setTimeout(() => {
+      previewTimer.current = null;
+      const from = previewFrom.current;
+      previewFrom.current = Number.POSITIVE_INFINITY;
+      void runStagePreviewsFrom(from, stagesRef.current);
+    }, 50);
+  };
+
   const updateStage = (index: number, fields: Partial<PipelineStage>) => {
-    setStages((prev) => {
-      const updated = prev.map((s, i) => (i === index ? { ...s, ...fields } : s));
-      // Trigger preview run for this stage and all subsequent stages
-      setTimeout(() => runStagePreviewsFrom(index, updated), 50);
-      return updated;
-    });
+    // The updater stays pure: React may call it twice (StrictMode).
+    setStages((prev) => prev.map((s, i) => (i === index ? { ...s, ...fields } : s)));
+    // Preview this stage and all subsequent ones.
+    schedulePreviewsFrom(index);
   };
 
   const runStagePreviewsFrom = async (startIndex: number, currentStages: PipelineStage[]) => {
