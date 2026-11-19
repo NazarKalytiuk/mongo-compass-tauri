@@ -27,7 +27,7 @@ bson = { version = "2.13.0", features = ["uuid-0_8", "chrono-0_4", "serde_with"]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures-util = "0.3"
-sha2 = "0.10"
+sha2 = "0.11"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"
