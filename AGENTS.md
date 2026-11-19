@@ -87,11 +87,17 @@ Argument names use `snake_case` on the Rust side; the Tauri runtime maps them fr
 ## Runtime / Tooling Preferences
 
 - **Package manager**: **npm** (lockfile `package-lock.json` is present; do not introduce pnpm/yarn/bun artifacts).
-- **Node version**: no `.nvmrc` / `engines` field. Use whatever Node is on `PATH` (Vite 7 + TypeScript 5.8 need Node ≥ 18).
+- **Node version**: Node 24 (as in CI). Vite 7 and TypeScript 5.8 need Node 18 or newer.
 - **Rust toolchain**: Tauri 2 requires stable Rust ≥ 1.77 + system deps per Tauri's platform guide.
 - **No lint/format config**: there is intentionally no ESLint, Prettier, rustfmt override, or clippy config. Do not add one without being asked. The only enforced checks are `tsc --strict` (with `noUnusedLocals` + `noUnusedParameters`) and the unit test suite.
 - **No path aliases**: imports use relative paths (`./types`, `../mongo`). Do not add `tsconfig` paths or Vite aliases.
-- **No CI**: no `.github/`. Tests run locally only.
+- **CI** is in `.github/workflows/ci.yml`. It runs on pushes, PRs and weekly:
+  - type-check, build and Vitest;
+  - `cargo test` with the integration tests, against two MongoDB 8 service containers (one plain, one with authentication);
+  - Playwright;
+  - `cargo audit` and `npm audit --audit-level=moderate`.
+
+  `release.yml` builds installers for a `v*` tag, or for a tag given to a manual run, into a draft release. Actions are pinned by SHA, and Dependabot keeps them and the dependencies current.
 - **No `.env` / secrets handling**: connection URIs are entered by the user; do not introduce env-var configuration without an explicit request.
 
 ## Development Commands

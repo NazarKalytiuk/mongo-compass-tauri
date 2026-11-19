@@ -555,6 +555,22 @@ fn extract_tools(archive_path: &Path, archive_kind: &str, bin_dir: &Path) -> Res
     Ok(())
 }
 
+/// Copies one archive entry into `bin_dir`, refusing more than `limit` bytes
+/// regardless of the size the archive declares.
+fn write_tool(entry: impl io::Read, bin_dir: &Path, file_name: &str, limit: u64) -> Result<(), String> {
+    let output_path = bin_dir.join(file_name);
+    let mut output = File::create(&output_path)
+        .map_err(|e| format!("Could not create {}: {e}", output_path.display()))?;
+    let copied = io::copy(&mut io::Read::take(entry, limit + 1), &mut output)
+        .map_err(|e| format!("Could not extract {file_name}: {e}"))?;
+    if copied > limit {
+        drop(output);
+        let _ = std::fs::remove_file(&output_path);
+        return Err(format!("{file_name} is unexpectedly large."));
+    }
+    Ok(())
+}
+
 fn extract_zip_tools(archive_path: &Path, bin_dir: &Path) -> Result<(), String> {
     let file =
         File::open(archive_path).map_err(|e| format!("Could not open tools ZIP archive: {e}"))?;
@@ -565,7 +581,11 @@ fn extract_zip_tools(archive_path: &Path, bin_dir: &Path) -> Result<(), String> 
         let mut entry = archive
             .by_index(index)
             .map_err(|e| format!("Could not read tools ZIP entry: {e}"))?;
-        let Some(file_name) = Path::new(entry.name())
+        let entry_name = entry
+            .name()
+            .map_err(|e| format!("Invalid name in tools ZIP archive: {e}"))?
+            .into_owned();
+        let Some(file_name) = Path::new(&entry_name)
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::to_string)
@@ -575,15 +595,10 @@ fn extract_zip_tools(archive_path: &Path, bin_dir: &Path) -> Result<(), String> 
         if !is_required_executable(&file_name) {
             continue;
         }
-        if entry.size() > MAX_BINARY_BYTES {
-            return Err(format!("{file_name} is unexpectedly large."));
+        if !entry.is_file() || entry.size() > MAX_BINARY_BYTES {
+            return Err(format!("{file_name} in the tools archive is not a regular file of a sane size."));
         }
-
-        let output_path = bin_dir.join(&file_name);
-        let mut output = File::create(&output_path)
-            .map_err(|e| format!("Could not create {}: {e}", output_path.display()))?;
-        io::copy(&mut entry, &mut output)
-            .map_err(|e| format!("Could not extract {file_name}: {e}"))?;
+        write_tool(&mut entry, bin_dir, &file_name, MAX_BINARY_BYTES)?;
     }
     Ok(())
 }
@@ -609,15 +624,10 @@ fn extract_tgz_tools(archive_path: &Path, bin_dir: &Path) -> Result<(), String> 
         if !is_required_executable(&file_name) {
             continue;
         }
-        if entry.header().size().unwrap_or(u64::MAX) > MAX_BINARY_BYTES {
-            return Err(format!("{file_name} is unexpectedly large."));
+        if !entry.header().entry_type().is_file() || entry.header().size().unwrap_or(u64::MAX) > MAX_BINARY_BYTES {
+            return Err(format!("{file_name} in the tools archive is not a regular file of a sane size."));
         }
-
-        let output_path = bin_dir.join(&file_name);
-        let mut output = File::create(&output_path)
-            .map_err(|e| format!("Could not create {}: {e}", output_path.display()))?;
-        io::copy(&mut entry, &mut output)
-            .map_err(|e| format!("Could not extract {file_name}: {e}"))?;
+        write_tool(&mut entry, bin_dir, &file_name, MAX_BINARY_BYTES)?;
     }
     Ok(())
 }
@@ -992,6 +1002,18 @@ mod tests {
         assert!(is_safe_relative_component("100.17.0-macos-arm64"));
         assert!(!is_safe_relative_component("../other"));
         assert!(!is_safe_relative_component("nested/path"));
+    }
+
+    #[test]
+    fn extraction_stops_at_the_size_limit_whatever_the_archive_declares() {
+        let dir = std::env::temp_dir().join(format!("compass-write-tool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_tool(&b"12345678"[..], &dir, "ok", 8).unwrap();
+        assert_eq!(std::fs::read(dir.join("ok")).unwrap(), b"12345678");
+        let err = write_tool(&b"123456789"[..], &dir, "big", 8).unwrap_err();
+        assert!(err.contains("unexpectedly large"), "{err}");
+        assert!(!dir.join("big").exists(), "a truncated binary must not be left behind");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

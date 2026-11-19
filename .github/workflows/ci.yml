@@ -5,33 +5,40 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Advisories appear without code changes.
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
 
 # Cancel superseded runs on the same ref
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   frontend:
     name: Frontend (type-check · build · unit tests)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
 
       - name: Type-check & build (tsc && vite build)
         run: npm run build
 
       - name: Upload production frontend build (dist)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: frontend-dist
           path: dist/
@@ -41,61 +48,57 @@ jobs:
         run: npm run test:unit
 
   backend:
-    name: Rust backend (cargo test · build)
-    runs-on: ubuntu-latest
+    name: Rust backend (unit + integration against MongoDB)
+    runs-on: ubuntu-24.04
+    services:
+      # Plain server for document round trips.
+      mongo:
+        image: mongo:8.0
+        ports: ["27017:27017"]
+      # Server with authentication for connection-string handling.
+      mongo-auth:
+        image: mongo:8.0
+        ports: ["27018:27017"]
+        env:
+          MONGO_INITDB_ROOT_USERNAME: ci_admin
+          MONGO_INITDB_ROOT_PASSWORD: "p@ss/w:rd!"
+    env:
+      COMPASS_IT_URI: mongodb://127.0.0.1:27017
+      # The password percent-encoded, as it must be in a URI.
+      COMPASS_IT_AUTH_URI: mongodb://ci_admin:p%40ss%2Fw%3Ard!@127.0.0.1:27018/?authSource=admin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Tauri system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            librsvg2-dev \
-            patchelf \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libssl-dev \
-            libxdo-dev \
-            libayatana-appindicator3-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev patchelf libssl-dev libxdo-dev libayatana-appindicator3-dev
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          workspaces: src-tauri
 
-      - name: cargo test
+      # tauri::generate_context! embeds the frontend; an empty dist is enough to compile.
+      - run: mkdir -p dist
+
+      - name: cargo test (unit + integration)
         working-directory: src-tauri
         run: cargo test --locked
 
-      - name: cargo build
-        working-directory: src-tauri
-        run: cargo build --locked
-
   e2e:
     name: E2E (Playwright · Chromium)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
 
       - name: Install Playwright browser (Chromium)
         run: npx playwright install --with-deps chromium
@@ -105,8 +108,25 @@ jobs:
 
       - name: Upload Playwright report
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: playwright-report
           path: playwright-report/
           retention-days: 7
+
+  audit:
+    name: Dependency audit (cargo · npm)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        working-directory: src-tauri
+        run: cargo audit
+
+      - name: npm audit
+        run: npm audit --audit-level=moderate
