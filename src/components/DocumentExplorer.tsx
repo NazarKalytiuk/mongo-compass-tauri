@@ -457,25 +457,21 @@ export default function DocumentExplorer({
   const handleSaveDoc = async (docJson: string) => {
     try {
       if (editingDoc) {
-        // Edit mode
+        // Edit mode: replace the whole document so removed fields are removed
+        // in the database too. Values keep their BSON types via Extended JSON.
         const idJson = JSON.stringify(editingDoc._id);
-        
-        // Mongo update commands require modifiers like $set
         const parsed = JSON.parse(docJson);
-        delete parsed._id; // _id is immutable in updates
-        
-        const updateJson = JSON.stringify({ $set: parsed });
         await invokeWithLog<any>(
           "UPDATE",
           `${activeDb}.${activeColl}`,
-          "update_document",
+          "replace_document",
           {
             dbName: activeDb,
             collName: activeColl,
             idJson,
-            updateJson,
+            docJson,
           },
-          JSON.stringify({ q: editingDoc._id, u: { $set: parsed } })
+          JSON.stringify({ q: { _id: editingDoc._id }, u: parsed })
         );
       } else {
         // Insert mode

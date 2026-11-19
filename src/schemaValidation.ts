@@ -2,7 +2,7 @@
  * Shared schema-validation helpers.
  * Used by DocumentEditorModal (live lint) and ValidationView (rule authoring + preview).
  */
-import { detectType } from "./bsonUtils";
+import { detectType, getNumericValue, numberKind } from "./bsonUtils";
 import { SchemaAnalysisResult } from "./schemaAnalyzer";
 
 export interface ValidationError {
@@ -23,11 +23,15 @@ export function matchBsonType(val: any, expected: string | string[]): boolean {
     case "boolean":
       return detected === "Boolean";
     case "number":
-    case "double":
-    case "int":
-    case "long":
-    case "decimal":
       return detected === "Number";
+    case "double":
+      return numberKind(val) === "double";
+    case "int":
+      return numberKind(val) === "int32";
+    case "long":
+      return numberKind(val) === "int64";
+    case "decimal":
+      return numberKind(val) === "decimal128";
     case "object":
       return detected === "Object";
     case "array":
@@ -117,11 +121,12 @@ export function validateAgainstSchema(
   }
 
   // Value bounds/ranges validation
-  if (typeof value === "number") {
-    if (typeof activeSchema.minimum === "number" && value < activeSchema.minimum) {
+  if (numberKind(value) !== null) {
+    const n = getNumericValue(value);
+    if (typeof activeSchema.minimum === "number" && n < activeSchema.minimum) {
       errors.push({ path, message: `Must be at least ${activeSchema.minimum}` });
     }
-    if (typeof activeSchema.maximum === "number" && value > activeSchema.maximum) {
+    if (typeof activeSchema.maximum === "number" && n > activeSchema.maximum) {
       errors.push({ path, message: `Must be at most ${activeSchema.maximum}` });
     }
   }

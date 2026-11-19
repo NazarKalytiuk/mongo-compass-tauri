@@ -1,6 +1,7 @@
 import { useState, useRef } from "react";
 import { X, AlertCircle, Check, Loader2, Upload, Download, FileText } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { numberKind, numberText } from "../bsonUtils";
 
 interface ImportExportModalProps {
   isOpen: boolean;
@@ -97,6 +98,8 @@ export default function ImportExportModal({
       const values = headers.map(header => {
         const val = doc[header];
         if (val === null || val === undefined) return "";
+        // Int64, integral doubles and decimals arrive wrapped ({"$numberLong": …}); CSV gets their digits.
+        if (numberKind(val) !== null) return `"${numberText(val)}"`;
         if (typeof val === "object") return `"${JSON.stringify(val).replace(/"/g, '""')}"`;
         return `"${String(val).replace(/"/g, '""')}"`;
       });

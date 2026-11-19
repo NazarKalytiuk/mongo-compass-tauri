@@ -13,6 +13,28 @@ describe("matchBsonType", () => {
     expect(matchBsonType({ $date: "x" }, "date")).toBe(true);
   });
 
+  it("tells BSON numeric types apart as the backend sends them", () => {
+    // Int32 and fractional doubles are plain numbers; the rest use EJSON wrappers.
+    expect(matchBsonType(5, "int")).toBe(true);
+    expect(matchBsonType(5, "long")).toBe(false);
+    expect(matchBsonType({ $numberLong: "5" }, "long")).toBe(true);
+    expect(matchBsonType({ $numberLong: "5" }, "int")).toBe(false);
+    expect(matchBsonType(2.5, "double")).toBe(true);
+    expect(matchBsonType({ $numberDouble: "3.0" }, "double")).toBe(true);
+    expect(matchBsonType({ $numberDouble: "3.0" }, "int")).toBe(false);
+    expect(matchBsonType({ $numberDecimal: "1.10" }, "decimal")).toBe(true);
+    for (const n of [5, { $numberLong: "5" }, { $numberDouble: "3.0" }, { $numberDecimal: "1" }]) {
+      expect(matchBsonType(n, "number")).toBe(true);
+    }
+  });
+
+  it("applies minimum/maximum to Extended JSON numbers", () => {
+    const schema = { bsonType: "long", minimum: 0, maximum: 10 };
+    expect(validateAgainstSchema({ $numberLong: "11" }, schema)).toEqual([{ path: "", message: "Must be at most 10" }]);
+    expect(validateAgainstSchema({ $numberLong: "-1" }, schema)).toEqual([{ path: "", message: "Must be at least 0" }]);
+    expect(validateAgainstSchema({ $numberLong: "7" }, schema)).toEqual([]);
+  });
+
   it("returns false on type mismatch and supports arrays of types", () => {
     expect(matchBsonType("hi", "number")).toBe(false);
     expect(matchBsonType("hi", ["number", "string"])).toBe(true);

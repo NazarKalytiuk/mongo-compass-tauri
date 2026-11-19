@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { X, AlertCircle, Plus, Trash2, Braces, ListTree } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { detectType, formatBsonDate, getNumericValue } from "../bsonUtils";
+import { detectType, formatBsonDate, numberFromText, numberKind, numberText, type NumberKind } from "../bsonUtils";
 import { validateAgainstSchema, ValidationError } from "../schemaValidation";
 
 interface DocumentEditorModalProps {
@@ -13,16 +13,18 @@ interface DocumentEditorModalProps {
   collName?: string;
 }
 
-type FieldType = "string" | "number" | "boolean" | "null" | "date" | "objectId" | "object" | "array";
+type FieldType = "string" | NumberKind | "boolean" | "null" | "date" | "objectId" | "object" | "array";
 
 interface FieldRow {
   id: string;
   key: string;
   type: FieldType;
-  value: any; // native for scalars; JSON string for object/array; ISO string for date; hex for objectId
+  value: any; // native for string/boolean; exact text for numbers; JSON string for object/array; ISO string for date; hex for objectId
 }
 
-const FIELD_TYPES: FieldType[] = ["string", "number", "boolean", "null", "date", "objectId", "object", "array"];
+const FIELD_TYPES: FieldType[] = ["string", "int32", "int64", "double", "decimal128", "boolean", "null", "date", "objectId", "object", "array"];
+const NUMBER_TYPES: readonly FieldType[] = ["int32", "int64", "double", "decimal128"];
+const isNumberType = (t: FieldType): t is NumberKind => NUMBER_TYPES.includes(t);
 
 let rowCounter = 0;
 const nextRowId = () => `row-${rowCounter++}`;
@@ -31,7 +33,7 @@ function detectFieldType(v: any): FieldType {
   const t = detectType(v);
   switch (t) {
     case "String": return "string";
-    case "Number": return "number";
+    case "Number": return numberKind(v) ?? "double";
     case "Boolean": return "boolean";
     case "Null": return "null";
     case "Date": return "date";
@@ -44,7 +46,10 @@ function detectFieldType(v: any): FieldType {
 function valueToRowValue(v: any, type: FieldType): any {
   switch (type) {
     case "string": return typeof v === "string" ? v : "";
-    case "number": return getNumericValue(v);
+    case "int32":
+    case "int64":
+    case "double":
+    case "decimal128": return numberText(v);
     case "boolean": return Boolean(v);
     case "null": return null;
     case "date": return v && typeof v === "object" && "$date" in v ? formatBsonDate(v.$date) : new Date().toISOString();
@@ -59,7 +64,14 @@ function valueToRowValue(v: any, type: FieldType): any {
 function rowToValue(row: FieldRow): any {
   switch (row.type) {
     case "string": return String(row.value ?? "");
-    case "number": return Number(row.value ?? 0);
+    case "int32":
+    case "int64":
+    case "double":
+    case "decimal128": {
+      const parsed = numberFromText(row.type, String(row.value ?? ""));
+      // Invalid text is reported by rowError and blocks saving; keep the text visible meanwhile.
+      return "value" in parsed ? parsed.value : String(row.value ?? "");
+    }
     case "boolean": return Boolean(row.value);
     case "null": return null;
     case "date": return { $date: row.value || new Date().toISOString() };
@@ -71,10 +83,19 @@ function rowToValue(row: FieldRow): any {
   }
 }
 
+function rowError(row: FieldRow): string | null {
+  if (!isNumberType(row.type)) return null;
+  const parsed = numberFromText(row.type, String(row.value ?? ""));
+  return "error" in parsed ? parsed.error : null;
+}
+
 function defaultValueForType(type: FieldType): any {
   switch (type) {
     case "string": return "";
-    case "number": return 0;
+    case "int32":
+    case "int64":
+    case "double":
+    case "decimal128": return "0";
     case "boolean": return false;
     case "null": return null;
     case "date": return new Date().toISOString();
@@ -211,8 +232,9 @@ export default function DocumentEditorModal({
     const next = rows.map((r) => {
       if (r.id !== id) return r;
       const merged = { ...r, ...patch };
-      // When type changes, reset value to a sensible default for the new type
-      if (patch.type && patch.type !== r.type) {
+      // When type changes, reset value to a sensible default for the new type.
+      // Switching between numeric types keeps the digits (e.g. Int32 → Int64).
+      if (patch.type && patch.type !== r.type && !(isNumberType(patch.type) && isNumberType(r.type))) {
         merged.value = defaultValueForType(patch.type);
       }
       return merged;
@@ -248,8 +270,15 @@ export default function DocumentEditorModal({
     }
   };
 
+  const invalidRow = () => (mode === "fields" ? rows.find((r) => rowError(r) !== null) : undefined);
+
   const handleSave = async () => {
     setError(null);
+    const bad = invalidRow();
+    if (bad) {
+      setError(`Field "${bad.key}": ${rowError(bad)}`);
+      return;
+    }
     try {
       JSON.parse(jsonText);
     } catch (err: any) {
@@ -270,6 +299,11 @@ export default function DocumentEditorModal({
 
   const handleInsertAndClone = async () => {
     setError(null);
+    const bad = invalidRow();
+    if (bad) {
+      setError(`Field "${bad.key}": ${rowError(bad)}`);
+      return;
+    }
     try {
       JSON.parse(jsonText);
     } catch (err: any) {
@@ -424,13 +458,22 @@ export default function DocumentEditorModal({
                               className="w-full px-2 py-1.5 border border-[#EBE7DF] bg-[#1B1F27] text-[#E6E6E6] font-mono rounded-md focus:outline-none focus:border-[#F2673C] resize-y"
                               spellCheck={false}
                             />
-                          ) : row.type === "number" ? (
-                            <input
-                              type="number"
-                              value={row.value}
-                              onChange={(e) => updateRow(row.id, { value: e.target.value })}
-                              className="w-full px-2 py-1.5 border border-[#EBE7DF] bg-[#FAFAF7] font-mono rounded-md focus:outline-none focus:border-[#F2673C]"
-                            />
+                          ) : isNumberType(row.type) ? (
+                            <>
+                              {/* Text, not type="number": Int64 and Decimal128 need every digit. */}
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                aria-label={`${row.key || "field"} value`}
+                                aria-invalid={rowError(row) !== null}
+                                value={row.value}
+                                onChange={(e) => updateRow(row.id, { value: e.target.value })}
+                                className={`w-full px-2 py-1.5 border bg-[#FAFAF7] font-mono rounded-md focus:outline-none ${
+                                  rowError(row) ? "border-[#DC2626] focus:border-[#DC2626]" : "border-[#EBE7DF] focus:border-[#F2673C]"
+                                }`}
+                              />
+                              {rowError(row) && <div className="mt-1 text-[10px] text-[#DC2626]">{rowError(row)}</div>}
+                            </>
                           ) : (
                             <input
                               type="text"

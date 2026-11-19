@@ -1,5 +1,7 @@
 mod database_tools;
-mod mongo;
+// Public so the integration tests in tests/ can drive them against a real server.
+pub mod ejson;
+pub mod mongo;
 
 use mongo::{AppState, ConnectionInfo, DocumentListResult};
 use tauri::State;
@@ -59,14 +61,14 @@ async fn insert_document(
 }
 
 #[tauri::command]
-async fn update_document(
+async fn replace_document(
     state: State<'_, AppState>,
     db_name: String,
     coll_name: String,
     id_json: String,
-    update_json: String,
+    doc_json: String,
 ) -> Result<(), String> {
-    mongo::update_document(&state, db_name, coll_name, id_json, update_json).await
+    mongo::replace_document(&state, db_name, coll_name, id_json, doc_json).await
 }
 
 #[tauri::command]
@@ -408,7 +410,7 @@ pub fn run() {
             list_collections,
             find_documents,
             insert_document,
-            update_document,
+            replace_document,
             delete_document,
             get_collections_stats,
             create_collection,

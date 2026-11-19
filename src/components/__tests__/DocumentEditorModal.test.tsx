@@ -1318,4 +1318,64 @@ describe("DocumentEditorModal", () => {
     // validator is null → linter block not shown
     expect(screen.queryByText("Schema Validation Linter")).not.toBeInTheDocument();
   });
+
+  // ── Field editor: BSON number types ─────────────────────────────────────────
+
+  describe("field editor keeps BSON number types", () => {
+    const doc = {
+      _id: { $oid: "65a1b2c3d4e5f60718293a4b" },
+      count: 5,
+      views: { $numberLong: "9007199254740993" },
+      ratio: { $numberDouble: "3.0" },
+      price: { $numberDecimal: "19.90" },
+    };
+
+    const openFields = (onSave: (json: string) => Promise<void>) => {
+      vi.mocked(invoke).mockResolvedValue(null);
+      render(<DocumentEditorModal isOpen={true} onClose={() => {}} onSave={onSave} documentData={doc} />);
+      fireEvent.click(screen.getByTitle("Field-by-field editor"));
+    };
+
+    it("shows each number with its exact type and digits", () => {
+      openFields(async () => {});
+      const types = screen.getAllByRole("combobox").map((el) => (el as HTMLSelectElement).value);
+      expect(types).toEqual(["objectId", "int32", "int64", "double", "decimal128"]);
+      expect(screen.getByLabelText("views value")).toHaveValue("9007199254740993");
+      expect(screen.getByLabelText("ratio value")).toHaveValue("3.0");
+    });
+
+    it("saves numbers in their original types after an edit", async () => {
+      const onSave = vi.fn(async (_json: string) => {});
+      openFields(onSave);
+      fireEvent.change(screen.getByLabelText("views value"), { target: { value: "9007199254740995" } });
+      fireEvent.change(screen.getByLabelText("ratio value"), { target: { value: "4" } });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      });
+      expect(JSON.parse(onSave.mock.calls[0]![0])).toEqual({
+        ...doc,
+        views: { $numberLong: "9007199254740995" },
+        ratio: { $numberDouble: "4" },
+      });
+    });
+
+    it("blocks saving a value that does not fit its type", async () => {
+      const onSave = vi.fn(async (_json: string) => {});
+      openFields(onSave);
+      fireEvent.change(screen.getByLabelText("count value"), { target: { value: "1.5" } });
+      expect(screen.getByLabelText("count value")).toHaveAttribute("aria-invalid", "true");
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      });
+      expect(onSave).not.toHaveBeenCalled();
+      expect(screen.getByText(/Field "count": Int32 must be a whole number/)).toBeInTheDocument();
+    });
+
+    it("keeps the digits when switching between number types", () => {
+      openFields(async () => {});
+      const countType = screen.getAllByRole("combobox")[1]!;
+      fireEvent.change(countType, { target: { value: "int64" } });
+      expect(screen.getByLabelText("count value")).toHaveValue("5");
+    });
+  });
 });

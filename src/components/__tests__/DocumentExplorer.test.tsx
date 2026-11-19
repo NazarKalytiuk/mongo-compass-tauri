@@ -1007,10 +1007,10 @@ describe("DocumentExplorer – CRUD operations", () => {
     expect(mockInvoke).toHaveBeenCalledWith("insert_document", expect.any(Object));
   });
 
-  it("calls update_document when saving in edit mode", async () => {
+  it("replaces the whole document when saving in edit mode", async () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "list_indexes") return [];
-      if (cmd === "update_document") return { matched: 1 };
+      if (cmd === "replace_document") return null;
       if (cmd === "find_documents") return { documents: [], total_count: 0 };
       return null;
     });
@@ -1021,7 +1021,15 @@ describe("DocumentExplorer – CRUD operations", () => {
       fireEvent.click(screen.getByText("SaveDoc"));
       await Promise.resolve();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("update_document", expect.any(Object));
+    // The edited document is sent as-is (no $set), so fields removed in the
+    // editor are removed in the database.
+    expect(mockInvoke).toHaveBeenCalledWith("replace_document", {
+      dbName: "store_db",
+      collName: "products",
+      idJson: JSON.stringify({ $oid: "507f1f77bcf86cd799439011" }),
+      docJson: JSON.stringify({ name: "test" }),
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("update_document", expect.anything());
   });
 
   it("handleSaveDoc throws when json is invalid (covers the error branch)", async () => {

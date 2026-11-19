@@ -1,3 +1,4 @@
+use crate::ejson;
 use mongodb::{
     bson::{self, doc, Document},
     options::{ClientOptions, FindOptions},
@@ -55,24 +56,18 @@ async fn get_uri(state: &AppState) -> Result<String, String> {
         .cloned()
 }
 
-/// Parse a JSON pipeline string into a `Vec<Document>` ready for aggregation.
+/// Parse a pipeline (Extended JSON array of stage objects) into a `Vec<Document>`.
 fn parse_pipeline(pipeline_str: &str) -> Result<Vec<Document>, String> {
-    let pipeline_json: serde_json::Value = serde_json::from_str(pipeline_str)
-        .map_err(|e| format!("Invalid pipeline JSON syntax: {}", e))?;
-    let pipeline_array = pipeline_json
-        .as_array()
-        .ok_or("Pipeline must be a JSON array of stages")?;
-    pipeline_array
-        .iter()
+    let stages = match ejson::parse_value(pipeline_str)? {
+        bson::Bson::Array(stages) => stages,
+        _ => return Err("Pipeline must be a JSON array of stages".to_string()),
+    };
+    stages
+        .into_iter()
         .enumerate()
-        .map(|(idx, stage_val)| {
-            let stage_bson = bson::to_bson(stage_val)
-                .map_err(|e| format!("BSON conversion error at stage {}: {}", idx, e))?;
-            #[allow(clippy::clone_on_copy)]
-            stage_bson
-                .as_document()
-                .map(|d| d.clone())
-                .ok_or_else(|| format!("Stage {} must be a JSON object", idx))
+        .map(|(idx, stage)| match stage {
+            bson::Bson::Document(doc) => Ok(doc),
+            _ => Err(format!("Stage {} must be a JSON object", idx)),
         })
         .collect()
 }
@@ -147,24 +142,6 @@ pub struct ConnectionInfo {
 pub struct DocumentListResult {
     pub documents: Vec<serde_json::Value>,
     pub total_count: u64,
-}
-
-// Helper: Parse a JSON query string into a BSON Document
-fn json_to_document(json_str: &str) -> Result<Document, String> {
-    let trimmed = json_str.trim();
-    if trimmed.is_empty() {
-        return Ok(Document::new());
-    }
-    let json_val: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|e| format!("Invalid JSON syntax: {}", e))?;
-    
-    let bson_val = bson::to_bson(&json_val)
-        .map_err(|e| format!("BSON conversion error: {}", e))?;
-        
-    match bson_val {
-        bson::Bson::Document(doc) => Ok(doc),
-        _ => Err("Expected a JSON object structure".to_string()),
-    }
 }
 
 // Connect to MongoDB and return server build version & database names
@@ -254,9 +231,9 @@ pub async fn find_documents(
     let db = client.database(&db_name);
     let collection = db.collection::<Document>(&coll_name);
 
-    let filter_doc = json_to_document(&filter_str)?;
-    let sort_doc = json_to_document(&sort_str)?;
-    let proj_doc = json_to_document(&projection_str)?;
+    let filter_doc = ejson::parse_document(&filter_str)?;
+    let sort_doc = ejson::parse_document(&sort_str)?;
+    let proj_doc = ejson::parse_document(&projection_str)?;
 
     // Configure options
     let mut find_options = FindOptions::default();
@@ -283,9 +260,7 @@ pub async fn find_documents(
     let mut documents = Vec::new();
     while cursor.advance().await.map_err(|e| format!("Cursor error: {}", e))? {
         let doc = cursor.deserialize_current().map_err(|e| format!("Deserialization error: {}", e))?;
-        let json_val = serde_json::to_value(&doc)
-            .map_err(|e| format!("BSON to JSON conversion error: {}", e))?;
-        documents.push(json_val);
+        documents.push(ejson::document_to_wire(doc));
     }
 
     // Get count
@@ -319,41 +294,43 @@ pub async fn insert_document(
     let db = client.database(&db_name);
     let collection = db.collection::<Document>(&coll_name);
     
-    let doc = json_to_document(&doc_json)?;
+    let doc = ejson::parse_document(&doc_json)?;
     
     let result = collection
         .insert_one(doc)
         .await
         .map_err(|e| format!("Insertion failed: {}", e))?;
-        
-    Ok(format!("{:?}", result.inserted_id))
+
+    Ok(ejson::to_wire(result.inserted_id).to_string())
 }
 
-// Update document by BSON ID
-pub async fn update_document(
+/// Replace the whole document with the given `_id`. Fields removed in the editor
+/// are removed from the database, and every value keeps its BSON type.
+pub async fn replace_document(
     state: &AppState,
     db_name: String,
     coll_name: String,
     id_json: String,
-    update_json: String,
+    doc_json: String,
 ) -> Result<(), String> {
     let client = get_client(&state).await?;
-    
-    let db = client.database(&db_name);
-    let collection = db.collection::<Document>(&coll_name);
-    
-    let id_val: serde_json::Value = serde_json::from_str(&id_json)
-        .map_err(|e| format!("Invalid ID JSON: {}", e))?;
-    let id_bson = bson::to_bson(&id_val)
-        .map_err(|e| format!("ID BSON conversion error: {}", e))?;
-        
-    let update_doc = json_to_document(&update_json)?;
-    
-    collection
-        .update_one(doc! { "_id": id_bson }, update_doc)
+    let collection = client.database(&db_name).collection::<Document>(&coll_name);
+
+    let id = ejson::parse_value(&id_json).map_err(|e| format!("Invalid _id: {}", e))?;
+    let replacement = ejson::parse_document(&doc_json)?;
+    if let Some(new_id) = replacement.get("_id") {
+        if *new_id != id {
+            return Err("_id cannot be changed. Insert a copy with the new _id and delete the original instead.".to_string());
+        }
+    }
+
+    let result = collection
+        .replace_one(doc! { "_id": id }, replacement)
         .await
         .map_err(|e| format!("Update failed: {}", e))?;
-        
+    if result.matched_count == 0 {
+        return Err("The document no longer exists: it was deleted or its _id changed since it was loaded.".to_string());
+    }
     Ok(())
 }
 
@@ -369,16 +346,15 @@ pub async fn delete_document(
     let db = client.database(&db_name);
     let collection = db.collection::<Document>(&coll_name);
     
-    let id_val: serde_json::Value = serde_json::from_str(&id_json)
-        .map_err(|e| format!("Invalid ID JSON: {}", e))?;
-    let id_bson = bson::to_bson(&id_val)
-        .map_err(|e| format!("ID BSON conversion error: {}", e))?;
-        
-    collection
-        .delete_one(doc! { "_id": id_bson })
+    let id = ejson::parse_value(&id_json).map_err(|e| format!("Invalid _id: {}", e))?;
+
+    let result = collection
+        .delete_one(doc! { "_id": id })
         .await
         .map_err(|e| format!("Deletion failed: {}", e))?;
-        
+    if result.deleted_count == 0 {
+        return Err("The document no longer exists.".to_string());
+    }
     Ok(())
 }
 
@@ -620,7 +596,7 @@ pub async fn create_index(
     let db = client.database(&db_name);
     let collection = db.collection::<Document>(&coll_name);
     
-    let keys_doc = json_to_document(&keys_json)?;
+    let keys_doc = ejson::parse_document(&keys_json)?;
     
     let mut options = mongodb::options::IndexOptions::default();
     options.name = name.filter(|n| !n.trim().is_empty());
@@ -752,9 +728,7 @@ pub async fn aggregate_documents(
     let mut count = 0;
     while cursor.advance().await.map_err(|e| format!("Cursor error: {}", e))? {
         let doc = cursor.deserialize_current().map_err(|e| format!("Deserialization error: {}", e))?;
-        let json_val = serde_json::to_value(&doc)
-            .map_err(|e| format!("BSON to JSON conversion error: {}", e))?;
-        documents.push(json_val);
+        documents.push(ejson::document_to_wire(doc));
         count += 1;
         if count >= 20 {
             break;
@@ -1171,14 +1145,8 @@ pub async fn insert_many(
     let collection = db.collection::<Document>(&coll_name);
     
     let mut documents = Vec::new();
-    for val in docs {
-        let bson_val = bson::to_bson(&val)
-            .map_err(|e| format!("BSON conversion error: {}", e))?;
-        if let bson::Bson::Document(doc) = bson_val {
-            documents.push(doc);
-        } else {
-            return Err("Expected objects in document list".to_string());
-        }
+    for (idx, val) in docs.into_iter().enumerate() {
+        documents.push(ejson::value_to_document(val).map_err(|e| format!("Document {}: {}", idx, e))?);
     }
     
     if documents.is_empty() {
@@ -1192,7 +1160,7 @@ pub async fn insert_many(
         
     let ids = result.inserted_ids
         .into_iter()
-        .map(|(_, id)| format!("{:?}", id))
+        .map(|(_, id)| ejson::to_wire(id).to_string())
         .collect();
         
     Ok(ids)
@@ -1437,7 +1405,7 @@ pub async fn set_collection_validator(
     let client = get_client(state).await?;
     let db = client.database(&db_name);
 
-    let validator = json_to_document(&validator_json)?;
+    let validator = ejson::parse_document(&validator_json)?;
 
     let mut cmd = doc! {
         "collMod": &coll_name,
@@ -1476,8 +1444,8 @@ pub async fn update_many(
     let db = client.database(&db_name);
     let collection = db.collection::<Document>(&coll_name);
 
-    let filter = json_to_document(&filter_json)?;
-    let update = json_to_document(&update_json)?;
+    let filter = ejson::parse_document(&filter_json)?;
+    let update = ejson::parse_document(&update_json)?;
 
     let res = collection
         .update_many(filter, update)
@@ -1501,7 +1469,7 @@ pub async fn delete_many(
     let db = client.database(&db_name);
     let collection = db.collection::<Document>(&coll_name);
 
-    let filter = json_to_document(&filter_json)?;
+    let filter = ejson::parse_document(&filter_json)?;
     let res = collection
         .delete_many(filter)
         .await
@@ -1519,7 +1487,7 @@ pub async fn count_documents(
     let client = get_client(state).await?;
     let db = client.database(&db_name);
     let collection = db.collection::<Document>(&coll_name);
-    let filter = json_to_document(&filter_json)?;
+    let filter = ejson::parse_document(&filter_json)?;
     collection
         .count_documents(filter)
         .await
@@ -1542,9 +1510,9 @@ pub async fn explain_find(
     let client = get_client(state).await?;
     let db = client.database(&db_name);
 
-    let filter = json_to_document(&filter_str)?;
-    let sort = json_to_document(&sort_str)?;
-    let projection = json_to_document(&projection_str)?;
+    let filter = ejson::parse_document(&filter_str)?;
+    let sort = ejson::parse_document(&sort_str)?;
+    let projection = ejson::parse_document(&projection_str)?;
 
     let mut find_cmd = doc! {
         "find": &coll_name,
@@ -1627,35 +1595,6 @@ pub async fn drop_database(state: &AppState, db_name: String) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_json_to_document_empty() {
-        let doc = json_to_document("").unwrap();
-        assert!(doc.is_empty());
-
-        let doc = json_to_document("   ").unwrap();
-        assert!(doc.is_empty());
-    }
-
-    #[test]
-    fn test_json_to_document_valid() {
-        let doc = json_to_document(r#"{"name": "John", "age": 30}"#).unwrap();
-        assert_eq!(doc.get_str("name").unwrap(), "John");
-        assert_eq!(doc.get_i64("age").unwrap(), 30);
-    }
-
-    #[test]
-    fn test_json_to_document_invalid() {
-        let res = json_to_document(r#"{"name": "John", "#);
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn test_json_to_document_extended_bson() {
-        let doc = json_to_document(r#"{"_id": {"$oid": "507f1f77bcf86cd799439011"}}"#).unwrap();
-        let id = doc.get_object_id("_id").unwrap();
-        assert_eq!(id.to_hex(), "507f1f77bcf86cd799439011");
-    }
 
     #[tokio::test]
     async fn test_connect_invalid_uri() {
@@ -1836,14 +1775,13 @@ mod tests {
     }
 
     #[test]
-    fn test_json_parsing_for_explain() {
-        let pipeline_str = r#"[{"$match": {"age": {"$gt": 20}}}]"#;
-        let pipeline_json: serde_json::Value = serde_json::from_str(pipeline_str).unwrap();
-        let pipeline_array = pipeline_json.as_array().unwrap();
-        assert_eq!(pipeline_array.len(), 1);
-        let stage_bson = bson::to_bson(&pipeline_array[0]).unwrap();
-        let stage_doc = stage_bson.as_document().unwrap();
-        assert!(stage_doc.contains_key("$match"));
+    fn test_parse_pipeline() {
+        let stages = parse_pipeline(r#"[{"$match": {"age": {"$gt": 20}}}, {"$limit": 5}]"#).unwrap();
+        assert_eq!(stages.len(), 2);
+        assert!(stages[0].contains_key("$match"));
+        assert_eq!(stages[1].get("$limit"), Some(&bson::Bson::Int32(5)));
+        assert!(parse_pipeline(r#"{"$match": {}}"#).unwrap_err().contains("array"));
+        assert!(parse_pipeline(r#"[1]"#).unwrap_err().contains("Stage 0"));
     }
 
     #[tokio::test]
@@ -1898,9 +1836,9 @@ mod tests {
     #[test]
     fn test_explain_find_command_build() {
         // Mirror the command-building logic of explain_find for an empty query
-        let filter = json_to_document("{}").unwrap();
+        let filter = ejson::parse_document("{}").unwrap();
         let mut find_cmd = doc! { "find": "users", "filter": filter };
-        let sort = json_to_document(r#"{"age": -1}"#).unwrap();
+        let sort = ejson::parse_document(r#"{"age": -1}"#).unwrap();
         if !sort.is_empty() {
             find_cmd.insert("sort", sort);
         }

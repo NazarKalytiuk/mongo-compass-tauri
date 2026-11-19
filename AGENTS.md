@@ -19,7 +19,13 @@ React (src/)  ──invoke()──▶  Tauri IPC  ──▶  Rust command (src-t
 
 - **Frontend → backend**: only via `invoke<T>("command_name", args)`. No event bus, no websockets, no custom IPC. All commands are async on the Rust side.
 - **Backend state**: one `mongodb::Client` held in `Arc<tokio::sync::Mutex<Option<Client>>>` inside `AppState` (`src-tauri/src/mongo.rs`). Disconnect resets the `Option` to `None`.
-- **BSON bridge**: `mongo::json_to_document` converts `serde_json::Value` → `bson::Bson` → `bson::Document` (and the reverse direction is implicit via serde). Extended-JSON types (`ObjectId`, `Date`, `NumberLong`, `NumberDecimal`) are passed as strings; the frontend renders them with special formatting helpers in `DocumentExplorer`.
+- **BSON bridge** (`src-tauri/src/ejson.rs`): documents travel as MongoDB Extended JSON v2, shaped to survive `JSON.parse`/`JSON.stringify` in the webview.
+  - Int32 and fractional doubles are plain numbers.
+  - Int64 is `{"$numberLong"}` and integral or non-finite doubles are `{"$numberDouble"}`. As plain numbers they would lose precision or change type.
+  - Everything else is relaxed EJSON (`$oid`, `$date`, `$binary`, …).
+  - Input is parsed with `ejson::parse_document` / `parse_value`, the `bson` crate's EJSON parser. Never use `bson::to_bson(&serde_json::Value)` or `serde_json::to_value(&Document)` for user data: both silently change types.
+  - Frontend helpers `numberKind` / `numberText` / `numberFromText` in `src/bsonUtils.ts` read and build numeric wire values.
+- **Editing replaces the document** (`replace_document`, i.e. `replace_one` by `_id`), so fields removed in the editor are removed in the database. Changing `_id` is rejected. Saving or deleting a document that no longer exists is an error, not a silent no-op.
 - **Errors**: Rust commands return `Result<T, String>`. Strings are surfaced to TS via the rejection side of the `invoke` promise and caught with `try/catch`. No `anyhow`, no `thiserror`, no custom error enums.
 - **UI navigation**: no router. `App.tsx` toggles `<ConnectView />` ↔ `<HomeView />` based on a `connected: boolean` state. `HomeView` holds an in-memory `TabState[]` (max 8 tabs) and selects the active pane from it.
 
@@ -61,8 +67,8 @@ Defined in `src-tauri/src/lib.rs`. All are `async fn ... -> Result<T, String>` a
 | `list_databases` | — | `string[]` |
 | `list_collections` | `dbName: string` | `string[]` |
 | `find_documents` | `dbName, collName, filter, sort, projection, limit, skip` | `DocumentListResult` |
-| `insert_document` | `dbName, collName, docJson` | `string` (inserted id) |
-| `update_document` | `dbName, collName, idJson, updateJson` | `void` |
+| `insert_document` | `dbName, collName, docJson` | `string` (inserted `_id` as Extended JSON) |
+| `replace_document` | `dbName, collName, idJson, docJson` (Extended JSON) | `void` |
 | `delete_document` | `dbName, collName, idJson` | `void` |
 | `get_collections_stats` | `dbName` | `CollectionStats[]` |
 | `create_collection` | `dbName, name, capped?, size?, max?` | `void` |
@@ -135,11 +141,19 @@ Tauri requires the Vite dev server on port **1420** (`strictPort: true`). If the
 
 ## Testing & QA
 
-Three independent test layers — do not collapse them.
+Four independent test layers. Do not collapse them.
 
 1. **Vitest unit tests** — `src/components/__tests__/ComponentName.test.tsx`. Run with `npm run test:unit`. jsdom + `@testing-library/react` + `@testing-library/jest-dom` + `@testing-library/user-event`. Mock `@tauri-apps/api/core` per-suite with `vi.mock("@tauri-apps/api/core", ...)`; assert on the `mockInvoke.mock.calls` to verify the right command is sent with the right args.
 2. **Playwright E2E** — `tests/e2e/connection.spec.ts`. Run with `npm run test:e2e`. One spec covering the full connection/CRUD/aggregation flow. The spec does **not** launch Tauri — it injects `window.__TAURI_INTERNALS__.invoke` mocks via `page.addInitScript` and runs against the bare Vite dev server. Selectors use `text=`, `role=`, `placeholder=`, and CSS — there are no `data-testid` attributes; do not add any.
-3. **Rust unit tests** — `src-tauri/src/mongo.rs` (`#[cfg(test)] mod tests`). Run with `cd src-tauri && cargo test`. Currently cover `json_to_document` (empty/valid/invalid/extended BSON) and `connect` with an invalid URI. No integration tests, no Tauri harness tests.
+3. **Rust unit tests**: `#[cfg(test)]` modules in `src-tauri/src/ejson.rs` (wire round trip through simulated JavaScript, query operators, malformed input) and `mongo.rs`. Run them with `cd src-tauri && cargo test`.
+4. **Rust integration tests**: `src-tauri/tests/documents.rs`, run against a real MongoDB. They are skipped unless `COMPASS_IT_URI` is set:
+
+   ```sh
+   docker run -d --name compass-it-mongo -p 127.0.0.1:27099:27017 mongo:8.0
+   cd src-tauri && COMPASS_IT_URI=mongodb://127.0.0.1:27099 cargo test --test documents
+   ```
+
+   Each test uses its own `compass_it_*` database.
 
 ### When adding a new component or command
 

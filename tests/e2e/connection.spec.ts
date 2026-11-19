@@ -8,6 +8,7 @@ test.describe("Connection Workflow (E2E)", () => {
       window.__TAURI_INTERNALS__ = {
         transformCallback: () => nextCallbackId++,
         invoke: async (cmd: string, args: any) => {
+          ((window as any).__invokeCalls ??= []).push({ cmd, args });
           if (cmd === "plugin:event|listen") {
             return args.handler;
           }
@@ -77,9 +78,9 @@ test.describe("Connection Workflow (E2E)", () => {
             };
           }
           if (cmd === "insert_document") {
-            return "ObjectId(\"789\")";
+            return JSON.stringify({ $oid: "789" });
           }
-          if (cmd === "update_document") {
+          if (cmd === "replace_document") {
             return null;
           }
           if (cmd === "delete_document") {
@@ -319,9 +320,16 @@ test.describe("Connection Workflow (E2E)", () => {
     await editBtn.click();
 
     await expect(page.getByRole("heading", { name: "Edit Document" })).toBeVisible();
-    // Save edit
+    // Remove a field and save: the whole document is replaced, so the field is gone in the database.
+    await page.locator("textarea").fill('{\n  "_id": {"$oid": "123"},\n  "name": "Premium Laptop"\n}');
     await page.getByRole("button", { name: "Save", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Edit Document" })).not.toBeVisible();
+    const replaced = await page.evaluate(() =>
+      (window as any).__invokeCalls.filter((c: any) => c.cmd === "replace_document").map((c: any) => c.args)
+    );
+    expect(replaced).toHaveLength(1);
+    expect(JSON.parse(replaced[0].idJson)).toEqual({ $oid: "123" });
+    expect(JSON.parse(replaced[0].docJson)).toEqual({ _id: { $oid: "123" }, name: "Premium Laptop" });
 
     // 4. Delete document
     page.once("dialog", async (dialog) => {

@@ -588,6 +588,28 @@ describe("ImportExportModal", () => {
     expect(blobText).toContain("vip");
   });
 
+  it("CSV export: Extended JSON numbers are written as their exact digits", async () => {
+    let capturedBlob: Blob | null = null;
+    const docs = [{ count: 5, views: { $numberLong: "9007199254740993" }, ratio: { $numberDouble: "3.0" }, price: { $numberDecimal: "19.90" } }];
+    renderModal({ currentPageDocs: docs });
+    vi.spyOn(URL, "createObjectURL").mockImplementation((blob) => {
+      capturedBlob = blob as Blob;
+      return "blob:mock";
+    });
+    vi.spyOn(URL, "revokeObjectURL").mockReturnValue(undefined);
+    vi.spyOn(document.body, "appendChild").mockImplementation((n) => n);
+    vi.spyOn(document.body, "removeChild").mockImplementation((n) => n);
+    fireEvent.click(screen.getByRole("button", { name: /Export Collection/i }));
+    fireEvent.change(screen.getAllByRole("combobox")[0], { target: { value: "csv" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Run Export/i }));
+    });
+
+    await screen.findByText("Exported 1 document(s) successfully!");
+    expect((await capturedBlob!.text()).split("\n")[1]).toBe('"5","9007199254740993","3.0","19.90"');
+  });
+
   it("CSV export: null/undefined fields appear as empty strings in output", async () => {
     let capturedBlob: Blob | null = null;
     const docs = [{ name: "Alice", age: null }, { name: "Bob" }];

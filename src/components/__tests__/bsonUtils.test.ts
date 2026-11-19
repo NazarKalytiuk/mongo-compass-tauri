@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
+  numberKind,
+  numberText,
+  numberFromText,
   detectType,
   isBsonNumber,
   getBsonNumberValue,
@@ -300,5 +303,47 @@ describe("stringifyValue", () => {
   it("falls back to String() for other types (e.g. Symbol)", () => {
     const sym = Symbol("test");
     expect(stringifyValue(sym)).toBe(String(sym));
+  });
+});
+
+describe("numberKind / numberText", () => {
+  it("reads the BSON type of every numeric wire form", () => {
+    expect(numberKind(5)).toBe("int32");
+    expect(numberKind(-2147483648)).toBe("int32");
+    expect(numberKind(2147483648)).toBe("int64");
+    expect(numberKind(2.5)).toBe("double");
+    expect(numberKind({ $numberLong: "9007199254740993" })).toBe("int64");
+    expect(numberKind({ $numberDouble: "3.0" })).toBe("double");
+    expect(numberKind({ $numberInt: "1" })).toBe("int32");
+    expect(numberKind({ $numberDecimal: "1.10" })).toBe("decimal128");
+    expect(numberKind("5")).toBeNull();
+    expect(numberKind({ $oid: "x" })).toBeNull();
+  });
+
+  it("keeps every digit of Int64 and Decimal128", () => {
+    expect(numberText({ $numberLong: "9007199254740993" })).toBe("9007199254740993");
+    expect(numberText({ $numberDecimal: "0.1000000000000000000000000000000001" })).toBe("0.1000000000000000000000000000000001");
+    expect(numberText(2.5)).toBe("2.5");
+  });
+});
+
+describe("numberFromText", () => {
+  it("builds wire values the backend stores with the chosen type", () => {
+    expect(numberFromText("int32", "42")).toEqual({ value: 42 });
+    expect(numberFromText("int64", "9007199254740993")).toEqual({ value: { $numberLong: "9007199254740993" } });
+    expect(numberFromText("double", "2.5")).toEqual({ value: 2.5 });
+    // An integral double must stay a double after JSON.stringify.
+    expect(numberFromText("double", "3")).toEqual({ value: { $numberDouble: "3" } });
+    expect(numberFromText("double", "NaN")).toEqual({ value: { $numberDouble: "NaN" } });
+    expect(numberFromText("decimal128", "1.10")).toEqual({ value: { $numberDecimal: "1.10" } });
+  });
+
+  it("rejects text that does not fit the type", () => {
+    expect(numberFromText("int32", "1.5")).toHaveProperty("error");
+    expect(numberFromText("int32", "2147483648")).toEqual({ error: "Out of Int32 range; use Int64" });
+    expect(numberFromText("int64", "9223372036854775808")).toEqual({ error: "Out of Int64 range" });
+    expect(numberFromText("int64", "")).toHaveProperty("error");
+    expect(numberFromText("double", "abc")).toHaveProperty("error");
+    expect(numberFromText("decimal128", "1,5")).toHaveProperty("error");
   });
 });
