@@ -1,92 +1,227 @@
 name: Release
 
-# Build native installers and publish a draft GitHub Release when a vX.Y.Z tag is pushed.
+# Pushing a vX.Y.Z tag (created by `npm run release -- X.Y.Z`) runs the full CI,
+# builds installers for macOS (universal), Linux and Windows into a draft release,
+# signs the updater artifacts, verifies them, writes latest.json and publishes.
+# Installed apps pick the release up through the in-app updater.
+# Tags with a pre-release suffix (v1.2.0-beta.1) are published as pre-releases and
+# are not offered by the updater, which follows only the latest release.
+# A manual run rebuilds an existing tag.
+
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build (e.g. v0.1.0)"
+        description: "Existing release tag to build (e.g. v0.2.0)"
         required: true
-        default: "v0.1.0"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_TERM_COLOR: always
+
 jobs:
-  release:
-    name: Build (${{ matrix.platform }})
+  checks:
+    name: Checks
+    uses: ./.github/workflows/ci.yml
+    with:
+      release: true
+
+  notes:
+    name: Release notes
+    runs-on: ubuntu-24.04
+    outputs:
+      body: ${{ steps.notes.outputs.body }}
+      prerelease: ${{ steps.notes.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - id: notes
+        run: |
+          node scripts/release.mjs notes "$TAG" > "$RUNNER_TEMP/notes.md"
+          {
+            echo "body<<__COMPASS_NOTES__"
+            cat "$RUNNER_TEMP/notes.md"
+            echo "__COMPASS_NOTES__"
+          } >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-* ]]; then echo "prerelease=true"; else echo "prerelease=false"; fi >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: [checks, notes]
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            args: "--target aarch64-apple-darwin"
-          - platform: macos-latest
-            args: "--target x86_64-apple-darwin"
-          - platform: ubuntu-22.04
+          - name: macOS universal
+            platform: macos-15
+            args: --target universal-apple-darwin
+          # The oldest supported Ubuntu keeps the AppImage/deb compatible with older glibc.
+          - name: Linux
+            platform: ubuntu-22.04
             args: ""
-          - platform: windows-latest
+          - name: Windows
+            platform: windows-latest
             args: ""
-
     runs-on: ${{ matrix.platform }}
-    env:
-      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      # A manual run must build the requested tag, not the default branch.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          ref: refs/tags/${{ env.TAG }}
 
       - name: Install Tauri system dependencies (Linux)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            librsvg2-dev \
-            patchelf \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libssl-dev \
-            libxdo-dev \
-            libayatana-appindicator3-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev patchelf build-essential file libssl-dev libxdo-dev libayatana-appindicator3-dev
 
-      - name: Setup Node
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
-          key: release-${{ matrix.args }}
+          key: release-${{ matrix.platform }}
 
-      - name: Install frontend dependencies
-        run: npm ci
+      - run: npm ci
 
-      - name: Build & publish Tauri app
+      # The bundler treats a set-but-empty APPLE_* variable as configured, so these
+      # are exported only when the secrets exist. Without them the app is ad-hoc signed.
+      - name: Developer ID signing and notarization (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::notice::No Developer ID configured: the app is ad-hoc signed and not notarized."
+            exit 0
+          fi
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then echo "::error::Secret $name is missing"; exit 1; fi
+            { echo "$name<<__COMPASS_SECRET__"; echo "${!name}"; echo "__COMPASS_SECRET__"; } >> "$GITHUB_ENV"
+          done
+
+      - name: Build and upload to the draft release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ env.TAG }}
-          releaseName: "Compass+ ${{ env.TAG }}"
-          releaseBody: "See the assets below to download and install Compass+."
+          releaseName: Compass+ ${{ env.TAG }}
+          releaseBody: ${{ needs.notes.outputs.body }}
           releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+          prerelease: ${{ needs.notes.outputs.prerelease }}
+          args: ${{ matrix.args }} --config src-tauri/tauri.release.conf.json
+          # The publish job writes latest.json for all platforms with public download URLs.
+          uploadUpdaterJson: false
+          retryAttempts: 1
+
+      - name: Verify the macOS bundle
+        if: runner.os == 'macOS'
+        run: |
+          brew install minisign
+          scripts/verify-bundle.sh src-tauri/target/universal-apple-darwin/release/bundle --archs "x86_64 arm64" --updater
+
+  publish:
+    name: Verify and publish
+    needs: [notes, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: sudo apt-get update && sudo apt-get install -y minisign
+
+      - name: Collect and verify updater artifacts
+        id: artifacts
+        run: |
+          dir="$RUNNER_TEMP/artifacts"
+          mkdir -p "$dir"
+          names=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | .assets[].name")
+          pick() {
+            local found
+            found=$(grep -E "$1" <<<"$names" || true)
+            if [ -z "$found" ] || [ "$(wc -l <<<"$found")" -ne 1 ]; then
+              echo "::error::expected exactly one asset matching $1, got: ${found:-none}" >&2
+              exit 1
+            fi
+            echo "$found"
+          }
+          mac=$(pick '_universal\.app\.tar\.gz$')
+          linux=$(pick '\.AppImage$')
+          windows=$(pick '-setup\.exe$')
+          jq -r '.plugins.updater.pubkey' src-tauri/tauri.conf.json | base64 -d > "$dir/key.pub"
+          for asset in "$mac" "$linux" "$windows"; do
+            gh release download "$TAG" --dir "$dir" --pattern "$asset" --pattern "$asset.sig"
+            base64 -d < "$dir/$asset.sig" > "$dir/$asset.minisig"
+            minisign -V -q -p "$dir/key.pub" -m "$dir/$asset" -x "$dir/$asset.minisig"
+            echo "$asset: signature ok"
+          done
+          {
+            echo "dir=$dir"
+            echo "mac=$mac"
+            echo "linux=$linux"
+            echo "windows=$windows"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write latest.json
+        env:
+          NOTES: ${{ needs.notes.outputs.body }}
+          DIR: ${{ steps.artifacts.outputs.dir }}
+          MAC: ${{ steps.artifacts.outputs.mac }}
+          LINUX: ${{ steps.artifacts.outputs.linux }}
+          WINDOWS: ${{ steps.artifacts.outputs.windows }}
+        run: |
+          printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.md"
+          node scripts/update-feed.mjs --repo "$GITHUB_REPOSITORY" --tag "$TAG" --notes "$RUNNER_TEMP/notes.md" --signatures "$DIR" \
+            --platform "darwin-aarch64=$MAC" --platform "darwin-x86_64=$MAC" \
+            --platform "linux-x86_64=$LINUX" --platform "windows-x86_64=$WINDOWS" > "$RUNNER_TEMP/latest.json"
+          jq . "$RUNNER_TEMP/latest.json"
+          gh release upload "$TAG" "$RUNNER_TEMP/latest.json" --clobber
+
+      - name: Publish
+        run: |
+          if [ "${{ needs.notes.outputs.prerelease }}" = true ]; then
+            gh release edit "$TAG" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$TAG" --draft=false --latest
+          fi
+          gh release view "$TAG" --json url,assets --jq '.url, (.assets[].name)'
+
+      - name: Verify the published update feed
+        if: needs.notes.outputs.prerelease == 'false'
+        run: scripts/verify-update-feed.sh "${TAG#v}"

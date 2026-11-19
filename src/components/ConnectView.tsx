@@ -5,6 +5,10 @@ import { Database, Trash2, Link2, AlertCircle, KeyRound } from "lucide-react";
 
 interface ConnectViewProps {
   onConnected: (info: ConnectionInfo) => void;
+  /** Running app version; null until known (or outside the desktop app). */
+  appVersion?: string | null;
+  checkingForUpdates?: boolean;
+  onCheckUpdates?: () => void;
 }
 
 const PRESETS_KEY = "mongo_compass_presets";
@@ -26,7 +30,7 @@ const ENV_COLORS = [
   { name: "Local", color: "#16A34A" },      // Success green
 ];
 
-export default function ConnectView({ onConnected }: ConnectViewProps) {
+export default function ConnectView({ onConnected, appVersion, checkingForUpdates, onCheckUpdates }: ConnectViewProps) {
   const [uri, setUri] = useState("mongodb://localhost:27017");
   const [name, setName] = useState("My MongoDB");
   const [envColor, setEnvColor] = useState(ENV_COLORS[3].color); // Default: Local (Green)
@@ -287,10 +291,17 @@ export default function ConnectView({ onConnected }: ConnectViewProps) {
           </div>
         </div>
 
-        <div className="p-4 border-t border-[#111827]/10 bg-[#EBE7DF]/40 text-center">
-          <p className="text-[10px] text-[#8A93A2]">
-            Tauri v2 · React 19 · Rust 1.95
-          </p>
+        <div className="p-4 border-t border-[#111827]/10 bg-[#EBE7DF]/40 flex items-center justify-between gap-2">
+          <p className="text-[10px] text-[#8A93A2]">Compass+ {appVersion ?? ""}</p>
+          {onCheckUpdates && (
+            <button
+              onClick={onCheckUpdates}
+              disabled={checkingForUpdates}
+              className="text-[10px] font-semibold text-[#5B6472] hover:text-[#F2673C] disabled:opacity-50 cursor-pointer"
+            >
+              {checkingForUpdates ? "Checking…" : "Check for updates"}
+            </button>
+          )}
         </div>
       </div>
 

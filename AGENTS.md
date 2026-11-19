@@ -178,10 +178,25 @@ Four independent test layers. Do not collapse them.
 
 No coverage threshold is configured. Aim for behavioral coverage: error paths, empty results, pagination boundaries, and the 8-tab limit. Do not write tests that just re-state the current implementation.
 
+## Releases and updates
+
+- **The version lives in `src-tauri/Cargo.toml` only.** Do not add `version` to `tauri.conf.json` or `package.json`.
+- **Release notes:** user-facing changes go under `## Unreleased` in `CHANGELOG.md`. Those notes become the release notes and the updater's "What's new".
+- **Cutting a release:** `npm run release -- X.Y.Z` tags it, and pushing the tag publishes it (see README → Releasing).
+- **In-app updates:**
+  - The UI is `src/updater.ts`, plus `UpdateNotice` and `App` state. It checks on launch and every 6 h in production builds, and restarts only on user action.
+  - The feed is `latest.json` on the latest GitHub Release. The release workflow writes it with `scripts/update-feed.mjs`, using public download URLs.
+  - It covers macOS (universal `.app.tar.gz`), the Linux AppImage and the Windows NSIS installer.
+- **Signing key:** never change `plugins.updater.pubkey` unless the signing key is deliberately rotated. Installed apps accept only updates signed by the matching key.
+  - The private key is `~/.tauri/compass-plus.key` on the maintainer's Mac.
+  - Its password is in the login Keychain (service `tauri-updater-signing-key`, account `compass-plus`).
+  - Both are also stored as repo secrets.
+- **Updater artifacts** come only from `src-tauri/tauri.release.conf.json`, so local and CI builds need no key.
+
 ## Things to watch for
 
 - **Port 1420 is sacred** — Tauri expects it, Playwright expects it, Vite's `strictPort` will fail otherwise.
 - **CSP is strict** (`default-src 'self'`, no inline scripts, `connect-src` IPC only). Remote origins or inline scripts need an explicit security review.
 - **No `data-testid`** — the existing E2E spec relies on semantic selectors; adding `data-testid` is fine if you need it, but update the spec to match.
 - **Capabilities file is minimal** — `core:default + opener:default`. Adding a new Tauri plugin requires both adding the plugin in `lib.rs` and extending `src-tauri/capabilities/default.json`.
-- **README is a template stub** — do not assume it documents the project. Update it when you add user-visible features.
+- **README** documents install, updates, development and releasing. Update it when you add user-visible features.

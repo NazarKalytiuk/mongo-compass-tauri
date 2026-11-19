@@ -8,6 +8,13 @@ on:
   # Advisories appear without code changes.
   schedule:
     - cron: "0 6 * * 1"
+  # The release workflow runs the same checks before building.
+  workflow_call:
+    inputs:
+      release:
+        description: Called from the release workflow, which builds its own bundles
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -46,6 +53,9 @@ jobs:
 
       - name: Unit tests (Vitest)
         run: npm run test:unit
+
+      - name: Release scripts (shellcheck)
+        run: shellcheck scripts/*.sh
 
   backend:
     name: Rust backend (unit + integration against MongoDB)
@@ -86,6 +96,34 @@ jobs:
       - name: cargo test (unit + integration)
         working-directory: src-tauri
         run: cargo test --locked
+
+  bundle:
+    name: Bundle (Linux .deb)
+    # Catches what only a real `tauri build` checks, e.g. mismatched Tauri npm/crate versions.
+    if: ${{ !inputs.release }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev patchelf libssl-dev libxdo-dev libayatana-appindicator3-dev
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri
+          key: bundle
+
+      - run: npm ci
+      - run: npm run tauri build -- --bundles deb
 
   e2e:
     name: E2E (Playwright · Chromium)
